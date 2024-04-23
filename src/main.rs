@@ -1,8 +1,10 @@
 
 use std::time::Instant;
-use anyhow::{anyhow, bail, Result};
+use std::num::TryFromIntError;
+use anyhow::{anyhow, bail, Result, Error};
 use clap::Parser;
 use std::path::PathBuf;
+use std::convert::TryFrom;
 use glob::glob;
 use std::io::{BufReader, BufRead, BufWriter, Cursor, Write};
 use std::fs::{OpenOptions, File};
@@ -140,14 +142,21 @@ fn setup_local_cell_mapper(local_cell_dir: &PathBuf, num_local_cells:usize) ->  
 }
     
 
-fn hash_vecu32(vec: Vec<u32>, seed: usize) -> u64 {
+fn hash_vec(vec: Vec<u16>, seed: usize) -> u64 {
     let mut hasher = DefaultHasher::new();
     seed.hash(&mut hasher);
     vec.hash(&mut hasher);
     hasher.finish()
 }
 
+fn vecu32_to_vecu16(vec_u32: Vec<u32>) -> Result<Vec<u16>, TryFromIntError> {
+    let x = vec_u32
+        .into_iter()
+        .map(|x| u16::try_from(x))
+        .collect::<Result<Vec<_>, _>>();
+    x
 
+}
 
 /*======================================================
 =              Tokenize/semishuffle code               =
@@ -208,8 +217,11 @@ fn tokenize_semishuffle_file(reader: BufReader<Cursor<Vec<u8>>>, local_cell_mapp
         let encoded = tokenizer.encode(text, false).unwrap();
         let mut tokens = encoded.get_ids().to_vec();
         tokens.push(tokenizer.token_to_id("<EOT>").unwrap());
-        all_tokens.extend(tokens);        
+        all_tokens.extend(tokens);       
     }
+    // Convert all tokens to u16 
+
+
     // Group tokens into contexts of length seqlen
     // And then figure out where each group should live and append it to that file
     let padding_token_id = tokenizer.token_to_id("<PAD>").unwrap();
@@ -219,7 +231,8 @@ fn tokenize_semishuffle_file(reader: BufReader<Cursor<Vec<u8>>>, local_cell_mapp
             let padding_size = seqlen - context.len();
             context.extend(vec![padding_token_id; padding_size]);
         }
-        let local_cell_fid = (hash_vecu32(context.clone(), hash_seed) % num_local_cells as u64) as usize;
+        let context = vecu32_to_vecu16(context).unwrap();
+        let local_cell_fid = (hash_vec(context.clone(), hash_seed) % num_local_cells as u64) as usize;
         let mut writer = local_cell_mapper.get(&local_cell_fid).unwrap().lock().unwrap();
         serialize_into(&mut *writer, &context).unwrap();
     }
@@ -315,6 +328,7 @@ fn process_local_cell(filename: &PathBuf, overflow_writer: Option<Arc<Mutex<BufW
             };
         } 
     }
+    fs::remove_file(filename).unwrap();
     pbar.lock().unwrap().inc(1);
     Ok(())
 }
