@@ -1,6 +1,7 @@
 
+use std::io::Read;
 use std::time::Instant;
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Result, Error};
 use clap::Parser;
 use std::path::PathBuf;
 use glob::glob;
@@ -27,8 +28,10 @@ use bincode::{deserialize_from, serialize_into};
 use rand::seq::SliceRandom;
 use rand::thread_rng;
 
+use flate2::read::MultiGzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
+use zstd::stream::read::Decoder as ZstdDecoder;
 
 
 pub mod s3;
@@ -74,12 +77,17 @@ struct Args {
 
     /// Seed to use for the hashing of documents
     #[arg(long, default_value_t=1234)]
-    hash_seed: usize
+    hash_seed: usize,
+
+    // How many times to retry s3 operations
+    #[arg(long, default_value_t=3)]
+    s3_retries: usize,
 
 }
 
 
 pub(crate) fn expand_dirs(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
+    // Given vector of local or s3 files/directories will return a vector of expanded files to tok-shuffle
     let mut files: Vec<PathBuf> = Vec::new();
     let runtime = tokio::runtime::Runtime::new().unwrap();
 
@@ -112,6 +120,7 @@ pub(crate) fn expand_dirs(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
 
 
 fn local_cell_id(local_cell_dir: &PathBuf, fid: usize) -> PathBuf {
+    // Gets filename of local cell given the directory and integer id 
     local_cell_dir.clone().join(format!("local_cell_{:08}.u32", fid))
 }
 
@@ -148,6 +157,28 @@ fn hash_vecu32(vec: Vec<u32>, seed: usize) -> u64 {
 }
 
 
+fn read_file_into_memory(input_file: &PathBuf) ->Result<Cursor<Vec<u8>>, Error>{
+    let mut file = File::open(input_file).expect("Failed to open file");
+
+    let mut contents = Vec::new();
+    let ext = input_file.extension().unwrap().to_string_lossy().to_lowercase();
+    if ext == "gz" {
+        // Gzip case        
+        let mut decoder = MultiGzDecoder::new(file);
+        decoder.read_to_end(&mut contents).expect("Failed to read loca gzip file");
+    } else if ext == "zstd" || ext == "zst" {
+        // Zstd case
+        let mut decoder = ZstdDecoder::new(file).unwrap();
+        decoder.read_to_end(&mut contents).expect("Failed to read local zstd file");
+    } else {
+        file.read_to_end(&mut contents).expect("Failed to read local file");
+
+        // No compression case 
+    }
+    Ok(Cursor::new(contents))
+}
+
+
 
 /*======================================================
 =              Tokenize/semishuffle code               =
@@ -155,25 +186,41 @@ fn hash_vecu32(vec: Vec<u32>, seed: usize) -> u64 {
 
 fn process_input_file(input_file: &PathBuf, local_cell_mapper: &HashMap<usize, Arc<Mutex<BufWriter<File>>>>, 
                       seqlen: usize, tokenizer_name: String, num_local_cells: usize, hash_seed: usize,
-                      pbar: Arc<Mutex<ProgressBar>>) -> Result<()> {
+                      pbar: Arc<Mutex<ProgressBar>>) -> Result<(), Error> {
     // Gather file into reader 
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();   
-    let reader = rt.block_on(get_reader_from_s3(input_file, Some(5))).unwrap();        
-
-
-    let _result = tokenize_semishuffle_file(reader, local_cell_mapper, seqlen, tokenizer_name, num_local_cells, hash_seed);
-    pbar.lock().unwrap().inc(0);
-    Ok(())
+    let reader = if is_s3(input_file) {
+        let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();   
+        match rt.block_on(get_reader_from_s3(input_file, Some(5))) {
+            Ok(result) => result,
+            Err(err) => {
+                eprintln!("Error! {:?}", err);
+                return Err(err.into());
+            }
+        }
+    } else {
+        let contents = read_file_into_memory(input_file).expect("Failed to read contents into memory");
+        BufReader::new(contents)
+    };
+    match tokenize_semishuffle_file(reader, local_cell_mapper, seqlen, tokenizer_name, num_local_cells, hash_seed) {
+        Ok(_) => {
+            pbar.lock().unwrap().inc(1);
+            return Ok(());
+        }
+        Err(err) => {
+            eprintln!("Errored tok/shuffling {:?} | {:?}", input_file, err);
+            return Err(err.into());
+        }
+    }
 }
 
 
 fn tokenize_semishuffle_file(reader: BufReader<Cursor<Vec<u8>>>, local_cell_mapper: &HashMap<usize, Arc<Mutex<BufWriter<File>>>>, 
                             seqlen: usize, tokenizer_name: String, num_local_cells: usize, 
-                            hash_seed: usize) -> Result<()> {
+                            hash_seed: usize) -> Result<(), Error> {
 
     // Load tokenizer
     let mut tokenizer = Tokenizer::from_pretrained(tokenizer_name, None).unwrap();
@@ -280,7 +327,7 @@ fn write_chunk_to_file(chunk: &[Vec<u32>], chunk_filename: PathBuf, total_token_
                 .enable_all()
                 .build()
                 .unwrap();   
-        rt.block_on(write_cursor_to_s3(&chunk_filename.clone(), bio)).unwrap()
+        rt.block_on(write_cursor_to_s3(&chunk_filename.clone(), bio)).unwrap();
     } else {
         let mut file = File::create(chunk_filename).expect("Failed to create file");
         std::io::copy(&mut bio, &mut file).expect("Failed to write to file");
