@@ -24,6 +24,6 @@ tar = "0.4.40"
 uuid = {version ="1.8.0", features = ["v4", "fast-rng", "macro-diagnostics"]}
 indicatif = "0.17.8"
 flate2 = "1.0"
-
+either = "1.6"
 
 

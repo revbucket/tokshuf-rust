@@ -31,6 +31,8 @@ use rand::thread_rng;
 
 use flate2::write::GzEncoder;
 use flate2::Compression;
+use rayon::prelude::*;
+use either::{Either};
 
 
 pub mod s3;
@@ -82,6 +84,8 @@ struct Args {
 
 
 pub(crate) fn expand_dirs(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
+    // For local directories -> does a glob over each directory to get all json*.gz files
+    // For s3 directories -> does an aws s3 ls to search for files
     let mut files: Vec<PathBuf> = Vec::new();
     let runtime = tokio::runtime::Runtime::new().unwrap();
 
@@ -114,12 +118,13 @@ pub(crate) fn expand_dirs(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
 
 
 fn local_cell_id(local_cell_dir: &PathBuf, fid: usize) -> PathBuf {
+    // Standardized method to name "local cell" files
     local_cell_dir.clone().join(format!("local_cell_{:08}.u32", fid))
 }
 
 
 fn setup_local_cell_mapper(local_cell_dir: &PathBuf, num_local_cells:usize) ->  HashMap<usize, Arc<Mutex<BufWriter<File>>>>{
-    // Creates num_local_cells files in the local_cell_dir and 
+    // Creates num_local_cells files in the local_cell_dir and returns a map from id-> threadsafe writer
     if !local_cell_dir.exists() {
         fs::create_dir_all(local_cell_dir).unwrap()
     }
@@ -143,6 +148,7 @@ fn setup_local_cell_mapper(local_cell_dir: &PathBuf, num_local_cells:usize) ->  
     
 
 fn hash_vec(vec: Vec<u16>, seed: usize) -> u64 {
+    // Hashes a vector of u16s into a u64 hash value
     let mut hasher = DefaultHasher::new();
     seed.hash(&mut hasher);
     vec.hash(&mut hasher);
@@ -150,6 +156,7 @@ fn hash_vec(vec: Vec<u16>, seed: usize) -> u64 {
 }
 
 fn vecu32_to_vecu16(vec_u32: Vec<u32>) -> Result<Vec<u16>, TryFromIntError> {
+    // Casts a vector of u32s to u16s, and if any element explodes, the whole fxn should err
     let x = vec_u32
         .into_iter()
         .map(|x| u16::try_from(x))
@@ -165,8 +172,7 @@ fn vecu32_to_vecu16(vec_u32: Vec<u32>) -> Result<Vec<u16>, TryFromIntError> {
 fn process_input_file(input_file: &PathBuf, local_cell_mapper: &HashMap<usize, Arc<Mutex<BufWriter<File>>>>, 
                       seqlen: usize, tokenizer_name: String, num_local_cells: usize, hash_seed: usize,
                       pbar: Arc<Mutex<ProgressBar>>) -> Result<()> {
-    // Gather file into reader 
-
+    // Gathers file from either s3 or local disk into in-memory line reader
     let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -183,11 +189,10 @@ fn process_input_file(input_file: &PathBuf, local_cell_mapper: &HashMap<usize, A
 fn tokenize_semishuffle_file(reader: BufReader<Cursor<Vec<u8>>>, local_cell_mapper: &HashMap<usize, Arc<Mutex<BufWriter<File>>>>, 
                             seqlen: usize, tokenizer_name: String, num_local_cells: usize, 
                             hash_seed: usize) -> Result<()> {
+    // For a reader, will tokenize each line, build contexts, and put each context into the appropriate local cell
 
     // Load tokenizer
     let mut tokenizer = Tokenizer::from_pretrained(tokenizer_name, None).unwrap();
-
-
     tokenizer.add_special_tokens(&[
         AddedToken {
             content: String::from("<EOT>"),
@@ -219,9 +224,6 @@ fn tokenize_semishuffle_file(reader: BufReader<Cursor<Vec<u8>>>, local_cell_mapp
         tokens.push(tokenizer.token_to_id("<EOT>").unwrap());
         all_tokens.extend(tokens);       
     }
-    // Convert all tokens to u16 
-
-
     // Group tokens into contexts of length seqlen
     // And then figure out where each group should live and append it to that file
     let padding_token_id = tokenizer.token_to_id("<PAD>").unwrap();
@@ -252,17 +254,25 @@ fn read_u32_file(filename: &PathBuf) -> Result<Vec<Vec<u32>>> {
     while let Ok(element) = deserialize_from::<_, Vec<u32>>(&mut reader) {
         output.push(element)
     }
-
     Ok(output)
 }
 
 fn get_chunk_filename(output_dir: &PathBuf, chunk_id: usize) -> PathBuf {
+    // Standardized method to name each output chunk tarfile
     output_dir.join(format!("chunk_{:08}.tar", chunk_id))
 }
 
-fn write_chunk_to_file(chunk: &[Vec<u32>], chunk_filename: PathBuf, total_token_count: &AtomicUsize) -> Result<()> {
-    // First collect chunk into tarfile and wrap in a bufWriter and then either send it to s3 or 
+fn finalize_chunk(chunk: &[Vec<u32>], output_dir: &PathBuf, 
+                  wds_chunk_id: &AtomicUsize, total_token_count: &AtomicUsize, 
+                ) -> Result<()> {
+    // Given a COMPLETE chunk, output directory, and atomic id/namer, and atomic token-counter
+    // Wraps the chunk in a tarfile and saves it in the output dir
 
+    // Computes the filename for the chunk
+    let chunk_id = wds_chunk_id.fetch_add(1, Ordering::SeqCst);
+    let chunk_filename = get_chunk_filename(output_dir, chunk_id);
+
+    // And then wraps the chunk in a tarfile 
     let tokens_here = chunk.len() * chunk[0].len();
     total_token_count.fetch_add(tokens_here, Ordering::SeqCst);
 
@@ -288,6 +298,8 @@ fn write_chunk_to_file(chunk: &[Vec<u32>], chunk_filename: PathBuf, total_token_
     }
     bio.set_position(0);
 
+
+    // And finally saves the chunk on disk/s3 
     if is_s3(&chunk_filename) {
         let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -300,34 +312,51 @@ fn write_chunk_to_file(chunk: &[Vec<u32>], chunk_filename: PathBuf, total_token_
     }
 
     // Use the `bio` buffer as needed
-    Ok(())
+    Ok(())   
+
 }
 
 
 fn process_local_cell(filename: &PathBuf, overflow_writer: Option<Arc<Mutex<BufWriter<File>>>>, output_dir: &PathBuf, 
                       wds_chunk_size: usize, wds_chunk_id: &AtomicUsize, total_token_count: &AtomicUsize,
                       pbar: Arc<Mutex<ProgressBar>>) -> Result<()> {
-    // open and read files into vec of vecs
+
+    // Given a "local cell" which has a bunch of contexts in it, shuffles it and groups into chunks of wds_chunk_size
+    // For complete chunks, finalizes these and pushes to output directory
+    // For incomplete chunks, if overflow writer exists -> write incomplete chunks to overflow file
+    // Also does some branching: if no overflow writer, then this is final step and we can write chunks in parallel
+    
     let mut rng = thread_rng();
     let mut contexts = read_u32_file(filename).unwrap();
     contexts.shuffle(&mut rng);
-    for chunk in contexts.chunks(wds_chunk_size) {
-        if chunk.len() == wds_chunk_size || overflow_writer.is_none() {
-            let chunk_id = wds_chunk_id.fetch_add(1, Ordering::SeqCst);
-            let chunk_filename = get_chunk_filename(output_dir, chunk_id);
-            write_chunk_to_file(chunk, chunk_filename, total_token_count).unwrap();
-        } else {
-            match overflow_writer {
-                Some(ref writer) => {
-                    let mut writer = writer.lock().unwrap();
+
+
+    let chunk_iterator = if overflow_writer.is_none() {
+        Either::Left(contexts.par_chunks(wds_chunk_size))
+    } else {
+        Either::Right(contexts.chunks(wds_chunk_size))
+    };
+    
+    chunk_iterator.either(
+        |par_chunks| {
+            par_chunks.for_each(|chunk| {
+                finalize_chunk(chunk, output_dir, wds_chunk_id, total_token_count).unwrap();
+            });
+        },
+        |chunks| {
+            for chunk in chunks {
+                if chunk.len() != wds_chunk_size {
+                    let mut writer = overflow_writer.as_ref().unwrap().lock().unwrap();
                     for context in chunk {
                         serialize_into(&mut *writer, &context).unwrap();                    
-                    }
-                },
-                _ => {}
-            };
-        } 
-    }
+                    }                    
+                } else {
+                    finalize_chunk(chunk, output_dir, wds_chunk_id, total_token_count).unwrap();                
+                }
+            }
+        }
+    );
+
     fs::remove_file(filename).unwrap();
     pbar.lock().unwrap().inc(1);
     Ok(())
