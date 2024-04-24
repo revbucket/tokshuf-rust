@@ -4,8 +4,8 @@ use anyhow::{Result};
 
 use aws_config::meta::region::RegionProviderChain;
 use aws_config::BehaviorVersion;
-use aws_sdk_s3::{Client};
-use aws_sdk_s3::operation::get_object::GetObjectOutput;
+use aws_sdk_s3::{Client, Error as S3Error};
+use aws_sdk_s3::operation::put_object::PutObjectOutput;
 use aws_sdk_s3::primitives::ByteStream;
 use async_compression::tokio::bufread::GzipDecoder as asyncGZ;
 use async_compression::tokio::bufread::ZstdDecoder as asyncZstd;
@@ -14,7 +14,6 @@ use rand::{Rng};
 use tokio::io::AsyncReadExt;
 use tokio::io::BufReader as tBufReader;
 use tokio::time::{Duration, sleep};
-
 
 
 /*==========================================================
@@ -49,21 +48,50 @@ pub(crate) fn split_s3_path<P: AsRef<Path>>(path: P) -> (String, String) {
 =              Asynchronous S3 Methods                       =
 ============================================================*/
 
-pub(crate) async fn get_s3_client() -> Client {
+
+async fn s3_retry<T, F, Fut>(max_retries: usize, mut operation: F) -> Result<T, S3Error> 
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, S3Error>>,
+{
+    let mut rng = rand::thread_rng();
+    let base_delay = Duration::from_millis(100);
+    let max_delay = Duration::from_millis(2000);    
+    let mut attempts = 0;
+    loop {
+        match operation().await {
+            Ok(result) => return Ok(result),
+            Err(err) if attempts < max_retries => {
+                println!("Error {}/{}: {}", err, attempts, max_retries);
+                let random_delay =  rng.gen_range(Duration::from_millis(0)..Duration::from_millis(1000));
+                let mut exponential_delay = base_delay * 2u32.pow(attempts as u32);
+                if exponential_delay > max_delay {
+                    exponential_delay = max_delay;
+                }
+                sleep(exponential_delay + random_delay).await;
+                attempts += 1;
+            }, 
+            Err(err) => return Err(err.into())
+        }
+    }
+}
+
+
+pub(crate) async fn get_s3_client() -> Result<Client, S3Error> {
     // Gets a client from default configs (setup with awscli)
     let region_provider = RegionProviderChain::default_provider();
     let config = aws_config::defaults(BehaviorVersion::latest())
         .region(region_provider)
         .load()
         .await;
-    Client::new(&config)
+    Ok(Client::new(&config))
 }
 
 
-pub(crate) async fn expand_s3_dir(s3_uri: &PathBuf) -> Result<Vec<PathBuf>> {
+pub(crate) async fn expand_s3_dir(s3_uri: &PathBuf) -> Result<Vec<PathBuf>, S3Error> {
     // Collects all .json.gz/.jsonl.gz files prefixed by the provided s3_uri 
     let mut s3_files: Vec<PathBuf> = Vec::new();
-    let client = get_s3_client().await;
+    let client = get_s3_client().await?;
     let (bucket, prefix) = split_s3_path(s3_uri);
 
     let mut response = client
@@ -77,7 +105,7 @@ pub(crate) async fn expand_s3_dir(s3_uri: &PathBuf) -> Result<Vec<PathBuf>> {
         match result {
             Ok(output) => {
                 for object in output.contents() {
-                    let key = object.key().unwrap();
+                    let key = object.key().unwrap_or_default();
                     if !(key.ends_with(".jsonl.gz") || key.ends_with(".json.gz") || key.ends_with(".jsonl.zstd")) {
                         continue;
                     }
@@ -88,54 +116,30 @@ pub(crate) async fn expand_s3_dir(s3_uri: &PathBuf) -> Result<Vec<PathBuf>> {
                 }
             }
             Err(err) => {
-                eprintln!("Error collecting S3 files | {err:?}")
+                eprintln!("Error collecting S3 files | {err:?}");
+                return Err(err.into());
             }
         }
     }
     Ok(s3_files)
 }
 
-
-
-pub(crate) async fn get_object_with_retry(bucket: &str, key: &str, num_retries: Option<usize>) -> Result<GetObjectOutput, aws_sdk_s3::Error> {
-    // Wrapper for get_object with some random retries
-    let mut attempts = 0;
-    let num_retries = num_retries.unwrap_or(5); // 3 retries by default
-    let base_delay = Duration::from_millis(100);
-    let max_delay = Duration::from_millis(2000);
-
-    let mut rng = rand::thread_rng();
-    let client = get_s3_client().await;
-    loop {
-        match client.get_object().bucket(bucket).key(key).send().await {
-            Ok(response) => return Ok(response),
-            Err(e) if attempts < num_retries => {
-                // Calculate delay for exponential backoff, add some randomness so multiple threads don't access at the
-                // same time.
-                println!("Error {}/{}: {}", e, attempts, num_retries);
-                let random_delay =  rng.gen_range(Duration::from_millis(0)..Duration::from_millis(1000));
-                let mut exponential_delay = base_delay * 2u32.pow(attempts as u32);
-                if exponential_delay > max_delay {
-                    exponential_delay = max_delay;
-                }
-                sleep(exponential_delay + random_delay).await;
-                attempts += 1;
-            }
-            Err(e) => {
-                println!("Too many errors reading: {}. Giving up.", key);
-                return Err(e.into());
-            }
-        }
-    }
+async fn get_object_with_retry(bucket: &str, key: &str, num_retries: usize) -> Result<ByteStream, S3Error> {
+    let client = get_s3_client().await?;
+    s3_retry(num_retries, || async {
+        let output = client.get_object().bucket(bucket).key(key).send().await?;
+        Ok(output.body)        
+    })
+    .await
 }
 
 
 
-pub(crate) async fn get_reader_from_s3<P: AsRef<Path>>(path: P, num_retries: Option<usize>) -> Result<BufReader<Cursor<Vec<u8>>>>{
+pub(crate) async fn get_reader_from_s3<P: AsRef<Path>>(path: P, num_retries: Option<usize>) -> Result<BufReader<Cursor<Vec<u8>>>, S3Error>{
     // Gets all the data from an S3 file and loads it into memory and returns a Bufreader over it
     let (s3_bucket, s3_key) = split_s3_path(&path);
-    let object = get_object_with_retry(&s3_bucket, &s3_key, num_retries).await?;
-    let body_stream = object.body.into_async_read();
+    let object_body = get_object_with_retry(&s3_bucket, &s3_key, num_retries.unwrap_or(5)).await?;
+    let body_stream = object_body.into_async_read();
     let mut data = Vec::new();
 
     if path.as_ref().extension().unwrap() == "zstd" {
@@ -155,17 +159,20 @@ pub(crate) async fn get_reader_from_s3<P: AsRef<Path>>(path: P, num_retries: Opt
 }
 
 
-pub(crate) async fn write_cursor_to_s3(s3_uri: &PathBuf, cursor: Cursor<Vec<u8>>) -> Result<()> {
+
+pub(crate) async fn write_cursor_to_s3(s3_uri: &PathBuf, cursor: Cursor<Vec<u8>>) -> Result<PutObjectOutput, S3Error> {
     let (s3_bucket, s3_key) = split_s3_path(s3_uri);
-    let client = get_s3_client().await;
-    let _ = client
+    let client = get_s3_client().await?;
+    let bytes = ByteStream::from(cursor.into_inner());
+    let response = client
             .put_object()
             .bucket(s3_bucket)
             .key(s3_key)
-            .body(ByteStream::from(cursor.into_inner())   )
+            .body(bytes)
             .send()
-            .await;   
-    Ok(())
+            .await?;   
+
+    Ok(response)
 }
 
 

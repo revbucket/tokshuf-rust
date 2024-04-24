@@ -1,4 +1,5 @@
 
+use std::io::Read;
 use std::time::Instant;
 use std::num::TryFromIntError;
 use anyhow::{anyhow, bail, Result, Error};
@@ -29,10 +30,13 @@ use bincode::{deserialize_from, serialize_into};
 use rand::seq::SliceRandom;
 use rand::thread_rng;
 
+use flate2::read::MultiGzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use rayon::prelude::*;
+
 use either::{Either};
+use zstd::stream::read::Decoder as ZstdDecoder;
 
 
 pub mod s3;
@@ -78,7 +82,11 @@ struct Args {
 
     /// Seed to use for the hashing of documents
     #[arg(long, default_value_t=1234)]
-    hash_seed: usize
+    hash_seed: usize,
+
+    // How many times to retry s3 operations
+    #[arg(long, default_value_t=3)]
+    s3_retries: usize,
 
 }
 
@@ -162,8 +170,28 @@ fn vecu32_to_vecu16(vec_u32: Vec<u32>) -> Result<Vec<u16>, TryFromIntError> {
         .map(|x| u16::try_from(x))
         .collect::<Result<Vec<_>, _>>();
     x
-
 }
+fn read_file_into_memory(input_file: &PathBuf) ->Result<Cursor<Vec<u8>>, Error>{
+    let mut file = File::open(input_file).expect("Failed to open file");
+
+    let mut contents = Vec::new();
+    let ext = input_file.extension().unwrap().to_string_lossy().to_lowercase();
+    if ext == "gz" {
+        // Gzip case        
+        let mut decoder = MultiGzDecoder::new(file);
+        decoder.read_to_end(&mut contents).expect("Failed to read loca gzip file");
+    } else if ext == "zstd" || ext == "zst" {
+        // Zstd case
+        let mut decoder = ZstdDecoder::new(file).unwrap();
+        decoder.read_to_end(&mut contents).expect("Failed to read local zstd file");
+    } else {
+        file.read_to_end(&mut contents).expect("Failed to read local file");
+
+        // No compression case 
+    }
+    Ok(Cursor::new(contents))
+}
+
 
 /*======================================================
 =              Tokenize/semishuffle code               =
@@ -171,26 +199,42 @@ fn vecu32_to_vecu16(vec_u32: Vec<u32>) -> Result<Vec<u16>, TryFromIntError> {
 
 fn process_input_file(input_file: &PathBuf, local_cell_mapper: &HashMap<usize, Arc<Mutex<BufWriter<File>>>>, 
                       seqlen: usize, tokenizer_name: String, num_local_cells: usize, hash_seed: usize,
-                      pbar: Arc<Mutex<ProgressBar>>) -> Result<()> {
-    // Gathers file from either s3 or local disk into in-memory line reader
-    let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();   
-    let reader = rt.block_on(get_reader_from_s3(input_file, Some(5))).unwrap();        
+                      pbar: Arc<Mutex<ProgressBar>>) -> Result<(), Error> {
+    // Gather file into reader 
 
-
-    let _result = tokenize_semishuffle_file(reader, local_cell_mapper, seqlen, tokenizer_name, num_local_cells, hash_seed);
-    pbar.lock().unwrap().inc(0);
-    Ok(())
+    let reader = if is_s3(input_file) {
+        let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();   
+        match rt.block_on(get_reader_from_s3(input_file, Some(5))) {
+            Ok(result) => result,
+            Err(err) => {
+                eprintln!("Error! {:?}", err);
+                return Err(err.into());
+            }
+        }
+    } else {
+        let contents = read_file_into_memory(input_file).expect("Failed to read contents into memory");
+        BufReader::new(contents)
+    };
+    match tokenize_semishuffle_file(reader, local_cell_mapper, seqlen, tokenizer_name, num_local_cells, hash_seed) {
+        Ok(_) => {
+            pbar.lock().unwrap().inc(1);
+            return Ok(());
+        }
+        Err(err) => {
+            eprintln!("Errored tok/shuffling {:?} | {:?}", input_file, err);
+            return Err(err.into());
+        }
+    }
 }
 
 
 fn tokenize_semishuffle_file(reader: BufReader<Cursor<Vec<u8>>>, local_cell_mapper: &HashMap<usize, Arc<Mutex<BufWriter<File>>>>, 
                             seqlen: usize, tokenizer_name: String, num_local_cells: usize, 
-                            hash_seed: usize) -> Result<()> {
+                            hash_seed: usize) -> Result<(), Error> {
     // For a reader, will tokenize each line, build contexts, and put each context into the appropriate local cell
-
     // Load tokenizer
     let mut tokenizer = Tokenizer::from_pretrained(tokenizer_name, None).unwrap();
     tokenizer.add_special_tokens(&[
@@ -305,7 +349,7 @@ fn finalize_chunk(chunk: &[Vec<u32>], output_dir: &PathBuf,
                 .enable_all()
                 .build()
                 .unwrap();   
-        rt.block_on(write_cursor_to_s3(&chunk_filename.clone(), bio)).unwrap()
+        rt.block_on(write_cursor_to_s3(&chunk_filename.clone(), bio)).unwrap();
     } else {
         let mut file = File::create(chunk_filename).expect("Failed to create file");
         std::io::copy(&mut bio, &mut file).expect("Failed to write to file");
