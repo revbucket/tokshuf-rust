@@ -599,6 +599,10 @@ fn collect_url_histogram(input_file: &PathBuf, pbar: Arc<Mutex<ProgressBar>>) ->
     for line in reader.lines() {
         let line = line?;
         let json: Value = serde_json::from_str(&line)?;
+        let text = json["text"].as_str().unwrap();
+        if text.len() == 0 {
+            continue;
+        }
         let url = json["url"].as_str().unwrap();
         let mut hasher = DefaultHasher::new();
         url.hash(&mut hasher);
@@ -634,9 +638,9 @@ fn main() {
     let args = Args::parse();
 
     let mut input_files = expand_dirs(args.input).unwrap();
-    input_files.truncate(16);
+    //input_files.truncate(16);
 
-    let pbar = ProgressBar::new(input_files.len() as u64)
+    let pbar = ProgressBar::new(4 * input_files.len() as u64)
         .with_style(
             ProgressStyle::with_template(
                 "Files {human_pos}/{human_len} [{elapsed_precise}/{duration_precise}] [{wide_bar:.cyan/blue}]",
@@ -650,17 +654,28 @@ fn main() {
     let mut final_histogram = input_files
         .par_iter()
         .map(|f| {collect_url_histogram(f, pbar.clone()).unwrap()})
+        .fold(|| HashMap::new(), |mut acc, local_histogram| {
+            for (word, count) in local_histogram {
+                *acc.entry(word).or_insert(0) += count;
+            }
+            pbar.lock().unwrap().inc(1);
+            acc
+        })
         .reduce(HashMap::new, |mut acc, local_histogram| {
             for (word, count) in local_histogram {
                 *acc.entry(word).or_insert(0) += count;
             }
+            pbar.lock().unwrap().inc(1);            
             acc
-        });        
+        });
+
+
     final_histogram.retain(|_, &mut value| value > 1);
 
-    println!("RAN IN {:?} secs", start_time.elapsed().as_secs());
     let serialized = serde_json::to_string(&final_histogram).unwrap();
     let mut file = File::create(args.output).unwrap();
     file.write_all(serialized.as_bytes()).unwrap();
+
+    println!("RAN IN {:?} secs", start_time.elapsed().as_secs());
 
 }
