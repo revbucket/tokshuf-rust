@@ -12,7 +12,7 @@ use std::fs::{OpenOptions, File};
 use std::fs;
 use std::fmt::Write as OtherWrite;
 use std::thread::available_parallelism;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::hash::{Hash, Hasher, DefaultHasher};
@@ -36,6 +36,7 @@ use flate2::Compression;
 use zstd::stream::read::Decoder as ZstdDecoder;
 use serde::de::DeserializeOwned;
 use rayon::prelude::*;
+
 pub mod s3;
 
 /*======================================================
@@ -620,6 +621,53 @@ fn collect_url_histogram(input_file: &PathBuf, pbar: Arc<Mutex<ProgressBar>>) ->
     Ok(counter)
 }
 
+fn collect_url_contains(input_file: &PathBuf, target: HashSet<String>, pbar: Arc<Mutex<ProgressBar>>) -> Result<HashMap<String, Vec<String>>, Error> {
+    let mut collector: HashMap<String, Vec<String>> = HashMap::new();
+    let reader = if is_s3(input_file) {
+        let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();   
+        match rt.block_on(get_reader_from_s3(input_file, Some(5))) {
+            Ok(result) => result,
+            Err(err) => {
+                eprintln!("Error! {:?}", err);
+                return Err(err.into());
+            }
+        }
+    } else {
+        let contents = read_file_into_memory(input_file).expect("Failed to read contents into memory");
+        BufReader::new(contents)
+    };    
+
+
+    for line in reader.lines() {
+        let line = line?;
+        let json: Value = serde_json::from_str(&line)?;
+        let text = json["text"].as_str().unwrap();
+        if text.len() == 0 {
+            continue;
+        }
+        let url = json["url"].as_str().unwrap();
+        let mut hasher = DefaultHasher::new();
+        url.hash(&mut hasher);
+        // hash_url.asotneuh();
+        let hash_url_u64 = hasher.finish();
+        let hash_url = format_hash(hash_url_u64);
+        if !target.contains(hash_url.as_str()) {
+            continue
+        }
+        let url_string = String::from(url);
+        collector.entry(url_string).or_insert_with(Vec::new).push(String::from(text));
+    }
+
+    pbar.lock().unwrap().inc(1);
+    Ok(collector)
+
+
+}
+
+
 fn format_hash(hash_value: u64) -> String {
     let mut result = String::new();
     write!(&mut result, "{:x}", hash_value).unwrap();
@@ -648,6 +696,15 @@ fn main() {
         );
     let pbar = Arc::new(Mutex::new(pbar));
     pbar.lock().unwrap().inc(0); // Makes pbar show up with 0/N files complete       
+
+
+    let file = File::open(args.local_cell_dir).expect("Unable to open file");
+    let reader = BufReader::new(file);
+    let data: Vec<String> = serde_json::from_reader(reader).expect("Unable to parse JSON");
+    let mut url_hashes: HashSet<String> = HashSet::new();
+    for el in data {
+        url_hashes.insert(el);
+    }
 
 
 
