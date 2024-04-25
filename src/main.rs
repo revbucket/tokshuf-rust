@@ -10,6 +10,7 @@ use glob::glob;
 use std::io::{BufReader, BufRead, BufWriter, Cursor, Write};
 use std::fs::{OpenOptions, File};
 use std::fs;
+use std::fmt::Write as OtherWrite;
 use std::thread::available_parallelism;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -34,7 +35,7 @@ use flate2::write::GzEncoder;
 use flate2::Compression;
 use zstd::stream::read::Decoder as ZstdDecoder;
 use serde::de::DeserializeOwned;
-
+use rayon::prelude::*;
 pub mod s3;
 
 /*======================================================
@@ -451,7 +452,7 @@ fn process_local_cell(filename: &PathBuf, overflow_writer: &Option<HashMap<usize
 =                     Main block                       =
 ======================================================*/
 
-
+/*
 fn main() {
 
     // Step 1: Setup phase: parse args and set up the:
@@ -571,6 +572,95 @@ fn main() {
     println!("-------------------------------");
     println!("Ran in {:?} (s)", start_time.elapsed().as_secs());
     println!("Processed {:?} tokens", total_token_count.fetch_add(0, Ordering::SeqCst));
+}
 
+*/
+
+fn collect_url_histogram(input_file: &PathBuf, pbar: Arc<Mutex<ProgressBar>>) -> Result<HashMap<String, usize>, Error> {
+    let mut counter: HashMap<String, usize> = HashMap::new();
+    let reader = if is_s3(input_file) {
+        let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();   
+        match rt.block_on(get_reader_from_s3(input_file, Some(5))) {
+            Ok(result) => result,
+            Err(err) => {
+                eprintln!("Error! {:?}", err);
+                return Err(err.into());
+            }
+        }
+    } else {
+        let contents = read_file_into_memory(input_file).expect("Failed to read contents into memory");
+        BufReader::new(contents)
+    };
+
+
+    for line in reader.lines() {
+        let line = line?;
+        let json: Value = serde_json::from_str(&line)?;
+        let url = json["url"].as_str().unwrap();
+        let mut hasher = DefaultHasher::new();
+        url.hash(&mut hasher);
+        // hash_url.asotneuh();
+        let hash_url_u64 = hasher.finish();
+        let hash_url = format_hash(hash_url_u64);
+
+        match counter.get(&hash_url) {
+            Some(count) => {counter.insert(hash_url, count + 1);},
+            None => {counter.insert(hash_url, 1);}
+        };
+    }
+
+    pbar.lock().unwrap().inc(1);
+    Ok(counter)
+}
+
+fn format_hash(hash_value: u64) -> String {
+    let mut result = String::new();
+    write!(&mut result, "{:x}", hash_value).unwrap();
+    result
+}
+
+
+fn main() {
+    // Hacky thing to count url histograms 
+    // Loop over files:
+    // For each file get: {hash(url) -> count}
+    // Return dict and merge into mega dict 
+
+    println!("Setting up Tok/Shuffle run");
+    let start_time = Instant::now();    
+    let args = Args::parse();
+
+    let mut input_files = expand_dirs(args.input).unwrap();
+    input_files.truncate(16);
+
+    let pbar = ProgressBar::new(input_files.len() as u64)
+        .with_style(
+            ProgressStyle::with_template(
+                "Files {human_pos}/{human_len} [{elapsed_precise}/{duration_precise}] [{wide_bar:.cyan/blue}]",
+            ).unwrap()
+        );
+    let pbar = Arc::new(Mutex::new(pbar));
+    pbar.lock().unwrap().inc(0); // Makes pbar show up with 0/N files complete       
+
+
+
+    let mut final_histogram = input_files
+        .par_iter()
+        .map(|f| {collect_url_histogram(f, pbar.clone()).unwrap()})
+        .reduce(HashMap::new, |mut acc, local_histogram| {
+            for (word, count) in local_histogram {
+                *acc.entry(word).or_insert(0) += count;
+            }
+            acc
+        });        
+    final_histogram.retain(|_, &mut value| value > 1);
+
+    println!("RAN IN {:?} secs", start_time.elapsed().as_secs());
+    let serialized = serde_json::to_string(&final_histogram).unwrap();
+    let mut file = File::create(args.output).unwrap();
+    file.write_all(serialized.as_bytes()).unwrap();
 
 }
