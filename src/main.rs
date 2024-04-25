@@ -576,7 +576,7 @@ fn main() {
 
 */
 
-fn collect_url_histogram(input_file: &PathBuf, pbar: Arc<Mutex<ProgressBar>>) -> Result<HashMap<String, usize>, Error> {
+fn collect_url_histogram(input_file: &PathBuf, pbar: Arc<Mutex<ProgressBar>>) -> Option<HashMap<String, usize>> {
     let mut counter: HashMap<String, usize> = HashMap::new();
     let reader = if is_s3(input_file) {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -587,7 +587,8 @@ fn collect_url_histogram(input_file: &PathBuf, pbar: Arc<Mutex<ProgressBar>>) ->
             Ok(result) => result,
             Err(err) => {
                 eprintln!("Error! {:?}", err);
-                return Err(err.into());
+                return None;
+                //return Err(err.into());
             }
         }
     } else {
@@ -597,8 +598,8 @@ fn collect_url_histogram(input_file: &PathBuf, pbar: Arc<Mutex<ProgressBar>>) ->
 
 
     for line in reader.lines() {
-        let line = line?;
-        let json: Value = serde_json::from_str(&line)?;
+        let line = line.unwrap();
+        let json: Value = serde_json::from_str(&line).unwrap();
         let text = json["text"].as_str().unwrap();
         if text.len() == 0 {
             continue;
@@ -617,7 +618,7 @@ fn collect_url_histogram(input_file: &PathBuf, pbar: Arc<Mutex<ProgressBar>>) ->
     }
 
     pbar.lock().unwrap().inc(1);
-    Ok(counter)
+    Some(counter)
 }
 
 fn format_hash(hash_value: u64) -> String {
@@ -653,7 +654,7 @@ fn main() {
 
     let mut final_histogram = input_files
         .par_iter()
-        .map(|f| {collect_url_histogram(f, pbar.clone()).unwrap()})
+        .filter_map(|f| {collect_url_histogram(f, pbar.clone())})
         .fold(|| HashMap::new(), |mut acc, local_histogram| {
             for (word, count) in local_histogram {
                 *acc.entry(word).or_insert(0) += count;
