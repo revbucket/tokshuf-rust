@@ -29,14 +29,9 @@ use tokenizers::tokenizer::{
 use bincode::{serialize_into};
 use rand::seq::SliceRandom;
 use rand::thread_rng;
-
-
 use flate2::read::MultiGzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
-use rayon::prelude::*;
-
-use either::{Either};
 use zstd::stream::read::Decoder as ZstdDecoder;
 use serde::de::DeserializeOwned;
 
@@ -473,7 +468,6 @@ fn main() {
     };
     let mut local_cell_mapper = setup_local_cell_mapper(&args.local_cell_dir, args.num_local_cells);
     let mut input_files = expand_dirs(args.input).unwrap();
-    input_files.truncate(32);
 
     let vocab_size = load_tokenizer(&args.tokenizer).unwrap().get_vocab_size(true);
     let use_u16 = vocab_size < 65536;
