@@ -25,4 +25,6 @@ uuid = {version ="1.8.0", features = ["v4", "fast-rng", "macro-diagnostics"]}
 indicatif = "0.17.8"
 flate2 = "1.0"
 either = "1.6"
+serde = "1.0.198"
+itertools = "0.10.0"
 

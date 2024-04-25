@@ -26,9 +26,10 @@ use tokenizers::tokenizer::{
     AddedToken, 
     Tokenizer
 };
-use bincode::{deserialize_from, serialize_into};
+use bincode::{serialize_into};
 use rand::seq::SliceRandom;
 use rand::thread_rng;
+
 
 use flate2::read::MultiGzDecoder;
 use flate2::write::GzEncoder;
@@ -37,7 +38,7 @@ use rayon::prelude::*;
 
 use either::{Either};
 use zstd::stream::read::Decoder as ZstdDecoder;
-
+use serde::de::DeserializeOwned;
 
 pub mod s3;
 
@@ -127,19 +128,13 @@ pub(crate) fn expand_dirs(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
 
 fn local_cell_id(local_cell_dir: &PathBuf, fid: usize) -> PathBuf {
     // Standardized method to name "local cell" files
-    local_cell_dir.clone().join(format!("local_cell_{:08}.u32", fid))
+    local_cell_dir.clone().join(format!("local_cell_{:08}.ubin", fid))
 }
 
 
-fn setup_local_cell_mapper(local_cell_dir: &PathBuf, num_local_cells:usize) ->  HashMap<usize, Arc<Mutex<BufWriter<File>>>>{
-    // Creates num_local_cells files in the local_cell_dir and returns a map from id-> threadsafe writer
-    if !local_cell_dir.exists() {
-        fs::create_dir_all(local_cell_dir).unwrap()
-    }
-
-    let mut local_cell_mapper = HashMap::new();
-    for fid in 0..num_local_cells {
-        let filename = local_cell_id(local_cell_dir, fid);
+fn setup_writers(filenames: Vec<&PathBuf>) -> HashMap<usize, Arc<Mutex<BufWriter<File>>>> {
+    let mut mapper = HashMap::new();
+    for (idx, filename) in filenames.into_iter().enumerate() {
         let writer = Arc::new(
             Mutex::new(
             BufWriter::new(
@@ -149,13 +144,25 @@ fn setup_local_cell_mapper(local_cell_dir: &PathBuf, num_local_cells:usize) ->  
             .open(filename)
             .unwrap()
         )));
-        local_cell_mapper.insert(fid, writer);
+        mapper.insert(idx, writer);
     }
-    local_cell_mapper
+    mapper
+}
+
+fn setup_local_cell_mapper(local_cell_dir: &PathBuf, num_local_cells:usize) ->  HashMap<usize, Arc<Mutex<BufWriter<File>>>>{
+    // Creates num_local_cells files in the local_cell_dir and returns a map from id-> threadsafe writer
+    if !local_cell_dir.exists() {
+        fs::create_dir_all(local_cell_dir).unwrap()
+    }
+    let filenames: Vec<PathBuf> = (0..num_local_cells)
+        .map(|fid| local_cell_id(local_cell_dir, fid))
+        .collect();
+    let filenames_ref = filenames.iter().collect::<Vec<_>>();
+    setup_writers(filenames_ref)
 }
     
 
-fn hash_vec(vec: Vec<u16>, seed: usize) -> u64 {
+fn hash_vec<T>(vec: Vec<T>, seed: usize) -> u64 where T: Hash {
     // Hashes a vector of u16s into a u64 hash value
     let mut hasher = DefaultHasher::new();
     seed.hash(&mut hasher);
@@ -168,9 +175,10 @@ fn vecu32_to_vecu16(vec_u32: Vec<u32>) -> Result<Vec<u16>, TryFromIntError> {
     let x = vec_u32
         .into_iter()
         .map(|x| u16::try_from(x))
-        .collect::<Result<Vec<_>, _>>();
+        .collect::<Result<Vec<u16>, TryFromIntError>>();
     x
 }
+
 fn read_file_into_memory(input_file: &PathBuf) ->Result<Cursor<Vec<u8>>, Error>{
     let mut file = File::open(input_file).expect("Failed to open file");
 
@@ -192,50 +200,7 @@ fn read_file_into_memory(input_file: &PathBuf) ->Result<Cursor<Vec<u8>>, Error>{
     Ok(Cursor::new(contents))
 }
 
-
-/*======================================================
-=              Tokenize/semishuffle code               =
-======================================================*/
-
-fn process_input_file(input_file: &PathBuf, local_cell_mapper: &HashMap<usize, Arc<Mutex<BufWriter<File>>>>, 
-                      seqlen: usize, tokenizer_name: String, num_local_cells: usize, hash_seed: usize,
-                      pbar: Arc<Mutex<ProgressBar>>) -> Result<(), Error> {
-    // Gather file into reader 
-
-    let reader = if is_s3(input_file) {
-        let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();   
-        match rt.block_on(get_reader_from_s3(input_file, Some(5))) {
-            Ok(result) => result,
-            Err(err) => {
-                eprintln!("Error! {:?}", err);
-                return Err(err.into());
-            }
-        }
-    } else {
-        let contents = read_file_into_memory(input_file).expect("Failed to read contents into memory");
-        BufReader::new(contents)
-    };
-    match tokenize_semishuffle_file(reader, local_cell_mapper, seqlen, tokenizer_name, num_local_cells, hash_seed) {
-        Ok(_) => {
-            pbar.lock().unwrap().inc(1);
-            return Ok(());
-        }
-        Err(err) => {
-            eprintln!("Errored tok/shuffling {:?} | {:?}", input_file, err);
-            return Err(err.into());
-        }
-    }
-}
-
-
-fn tokenize_semishuffle_file(reader: BufReader<Cursor<Vec<u8>>>, local_cell_mapper: &HashMap<usize, Arc<Mutex<BufWriter<File>>>>, 
-                            seqlen: usize, tokenizer_name: String, num_local_cells: usize, 
-                            hash_seed: usize) -> Result<(), Error> {
-    // For a reader, will tokenize each line, build contexts, and put each context into the appropriate local cell
-    // Load tokenizer
+fn load_tokenizer(tokenizer_name: &String) -> Result<Tokenizer> {
     let mut tokenizer = Tokenizer::from_pretrained(tokenizer_name, None).unwrap();
     tokenizer.add_special_tokens(&[
         AddedToken {
@@ -255,6 +220,55 @@ fn tokenize_semishuffle_file(reader: BufReader<Cursor<Vec<u8>>>, local_cell_mapp
             special: true
         },
     ]);
+    Ok(tokenizer)
+}
+
+
+
+/*======================================================
+=              Tokenize/semishuffle code               =
+======================================================*/
+
+fn process_input_file(input_file: &PathBuf, local_cell_mapper: &HashMap<usize, Arc<Mutex<BufWriter<File>>>>, 
+                      seqlen: usize, tokenizer_name: String, num_local_cells: usize, hash_seed: usize,
+                      use_u16: bool, pbar: Arc<Mutex<ProgressBar>>) -> Result<(), Error> {
+    // Gather file into reader 
+
+    let reader = if is_s3(input_file) {
+        let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();   
+        match rt.block_on(get_reader_from_s3(input_file, Some(5))) {
+            Ok(result) => result,
+            Err(err) => {
+                eprintln!("Error! {:?}", err);
+                return Err(err.into());
+            }
+        }
+    } else {
+        let contents = read_file_into_memory(input_file).expect("Failed to read contents into memory");
+        BufReader::new(contents)
+    };
+    match tokenize_semishuffle_file(reader, local_cell_mapper, seqlen, tokenizer_name, num_local_cells, hash_seed, use_u16) {
+        Ok(_) => {
+            pbar.lock().unwrap().inc(1);
+            return Ok(());
+        }
+        Err(err) => {
+            eprintln!("Errored tok/shuffling {:?} | {:?}", input_file, err);
+            return Err(err.into());
+        }
+    }
+}
+
+
+fn tokenize_semishuffle_file(reader: BufReader<Cursor<Vec<u8>>>, local_cell_mapper: &HashMap<usize, Arc<Mutex<BufWriter<File>>>>, 
+                            seqlen: usize, tokenizer_name: String, num_local_cells: usize, 
+                            hash_seed: usize, use_u16: bool) -> Result<(), Error> {
+    // For a reader, will tokenize each line, build contexts, and put each context into the appropriate local cell
+    // Load tokenizer
+    let tokenizer = load_tokenizer(&tokenizer_name).unwrap();
 
     // Tokenize all lines in the file
     let mut all_tokens = Vec::new();
@@ -277,10 +291,16 @@ fn tokenize_semishuffle_file(reader: BufReader<Cursor<Vec<u8>>>, local_cell_mapp
             let padding_size = seqlen - context.len();
             context.extend(vec![padding_token_id; padding_size]);
         }
-        let context = vecu32_to_vecu16(context).unwrap();
         let local_cell_fid = (hash_vec(context.clone(), hash_seed) % num_local_cells as u64) as usize;
         let mut writer = local_cell_mapper.get(&local_cell_fid).unwrap().lock().unwrap();
-        serialize_into(&mut *writer, &context).unwrap();
+
+        if use_u16 {
+            let context = vecu32_to_vecu16(context).unwrap();
+            serialize_into(&mut *writer, &context).unwrap();
+        }
+        else {
+            serialize_into(&mut *writer, &context).unwrap();
+        }
     }
     Ok(())
 }
@@ -290,14 +310,20 @@ fn tokenize_semishuffle_file(reader: BufReader<Cursor<Vec<u8>>>, local_cell_mapp
 =                 Final shuffle code                   =
 ======================================================*/
 
-fn read_u32_file(filename: &PathBuf) -> Result<Vec<Vec<u32>>> {
-    let file = File::open(filename).unwrap();
+fn read_serialized_file<T>(filename: &PathBuf) -> Result<Vec<Vec<u32>>, Box<dyn std::error::Error>>
+where
+    T: DeserializeOwned + TryFrom<u16>,
+    <T as TryFrom<u16>>::Error: std::error::Error + 'static, u32: From<T>, u32: From<T>
+{
+    let file = File::open(filename)?;
     let mut reader = BufReader::new(file);
     let mut output = Vec::new();
 
-    while let Ok(element) = deserialize_from::<_, Vec<u32>>(&mut reader) {
-        output.push(element)
+    while let Ok(element) = bincode::deserialize_from::<_, Vec<T>>(&mut reader) {
+        let element_u32: Result<Vec<u32>, _> = element.into_iter().map(|x| u32::try_from(x)).collect();
+        output.push(element_u32?);
     }
+
     Ok(output)
 }
 
@@ -305,6 +331,27 @@ fn get_chunk_filename(output_dir: &PathBuf, chunk_id: usize) -> PathBuf {
     // Standardized method to name each output chunk tarfile
     output_dir.join(format!("chunk_{:08}.tar", chunk_id))
 }
+
+fn get_overflow_filename(local_cell_dir: &PathBuf, overflow_round: usize, overflow_id: usize) -> PathBuf {
+    local_cell_dir.join(format!("overflow_{:04}_{:08}.ubin", overflow_round, overflow_id))
+}
+
+fn build_overflow_writers(local_cell_dir: &PathBuf, overflow_round: usize, num_overflows: usize) -> 
+    (Option<HashMap<usize, Arc<Mutex<BufWriter<File>>>>>, Vec<PathBuf>) {    
+    let mut overflow_filenames: Vec<PathBuf> = Vec::new();
+    if num_overflows == 0 {
+        return (None, Vec::new());
+    }
+
+    for idx in 0..num_overflows {
+        let overflow_filename = get_overflow_filename(local_cell_dir, overflow_round, idx);
+        overflow_filenames.push(overflow_filename);
+    }
+
+    let overflow_filenames_ref = overflow_filenames.iter().collect::<Vec<_>>();
+    (Some(setup_writers(overflow_filenames_ref)), overflow_filenames)
+}
+
 
 fn finalize_chunk(chunk: &[Vec<u32>], output_dir: &PathBuf, 
                   wds_chunk_id: &AtomicUsize, total_token_count: &AtomicUsize, 
@@ -355,15 +402,14 @@ fn finalize_chunk(chunk: &[Vec<u32>], output_dir: &PathBuf,
         std::io::copy(&mut bio, &mut file).expect("Failed to write to file");
     }
 
-    // Use the `bio` buffer as needed
     Ok(())   
 
 }
 
 
-fn process_local_cell(filename: &PathBuf, overflow_writer: Option<Arc<Mutex<BufWriter<File>>>>, output_dir: &PathBuf, 
+fn process_local_cell(filename: &PathBuf, overflow_writer: &Option<HashMap<usize, Arc<Mutex<BufWriter<File>>>>>, output_dir: &PathBuf, 
                       wds_chunk_size: usize, wds_chunk_id: &AtomicUsize, total_token_count: &AtomicUsize,
-                      pbar: Arc<Mutex<ProgressBar>>) -> Result<()> {
+                      use_u16:bool, hash_seed: usize, pbar: Arc<Mutex<ProgressBar>>) -> Result<()> {
 
     // Given a "local cell" which has a bunch of contexts in it, shuffles it and groups into chunks of wds_chunk_size
     // For complete chunks, finalizes these and pushes to output directory
@@ -371,37 +417,37 @@ fn process_local_cell(filename: &PathBuf, overflow_writer: Option<Arc<Mutex<BufW
     // Also does some branching: if no overflow writer, then this is final step and we can write chunks in parallel
     
     let mut rng = thread_rng();
-    let mut contexts = read_u32_file(filename).unwrap();
-    contexts.shuffle(&mut rng);
-
-
-    let chunk_iterator = if overflow_writer.is_none() {
-        Either::Left(contexts.par_chunks(wds_chunk_size))
+    let mut contexts = if use_u16 {
+        read_serialized_file::<u16>(filename).unwrap()
     } else {
-        Either::Right(contexts.chunks(wds_chunk_size))
+        read_serialized_file::<u32>(filename).unwrap()
     };
-    
-    chunk_iterator.either(
-        |par_chunks| {
-            par_chunks.for_each(|chunk| {
-                finalize_chunk(chunk, output_dir, wds_chunk_id, total_token_count).unwrap();
-            });
-        },
-        |chunks| {
-            for chunk in chunks {
-                if chunk.len() != wds_chunk_size {
-                    let mut writer = overflow_writer.as_ref().unwrap().lock().unwrap();
-                    for context in chunk {
-                        serialize_into(&mut *writer, &context).unwrap();                    
-                    }                    
-                } else {
-                    finalize_chunk(chunk, output_dir, wds_chunk_id, total_token_count).unwrap();                
-                }
-            }
-        }
-    );
 
-    fs::remove_file(filename).unwrap();
+    println!("FILENAME {:?} HAS LEN {:?}", filename, contexts.len());
+    contexts.shuffle(&mut rng);
+    for chunk in contexts.chunks(wds_chunk_size) {
+        if chunk.len() != wds_chunk_size && !overflow_writer.is_none() { // short chunk, send to one of the overflows
+            //let mut writer = local_cell_mapper.get(&local_cell_fid).unwrap().lock().unwrap();
+            let num_overflows = overflow_writer.as_ref().unwrap().len() as u64;
+            let overflow_writer = overflow_writer.as_ref().unwrap();
+            for context in chunk {
+                let context_hash = hash_vec::<u32>(context.clone(), hash_seed);
+                let mut writer = overflow_writer.get(&((context_hash % num_overflows) as usize)).unwrap().lock().unwrap();
+                if use_u16 {
+                    let context = vecu32_to_vecu16(context.clone()).unwrap();
+                    serialize_into(&mut *writer, &context).unwrap();
+                }
+                else {
+                    serialize_into(&mut *writer, &context).unwrap();
+                }
+
+            }
+        } else { // regular length, finalize chunk
+            finalize_chunk(chunk, output_dir, wds_chunk_id, total_token_count).unwrap();                
+        }
+    }
+
+    //fs::remove_file(filename).unwrap();
     pbar.lock().unwrap().inc(1);
     Ok(())
 }
@@ -426,7 +472,14 @@ fn main() {
         args.threads
     };
     let mut local_cell_mapper = setup_local_cell_mapper(&args.local_cell_dir, args.num_local_cells);
-    let input_files = expand_dirs(args.input).unwrap();
+    let mut input_files = expand_dirs(args.input).unwrap();
+    input_files.truncate(32);
+
+    let vocab_size = load_tokenizer(&args.tokenizer).unwrap().get_vocab_size(true);
+    let use_u16 = vocab_size < 65536;
+
+
+
     let pbar = ProgressBar::new(input_files.len() as u64)
         .with_style(
             ProgressStyle::with_template(
@@ -447,7 +500,7 @@ fn main() {
         let pbar = pbar.clone();
         threadpool.execute(move || {
             process_input_file(&input_file, &local_cell_mapper, args.seqlen, tokenizer_name,
-                               args.num_local_cells, args.hash_seed, pbar).unwrap()
+                               args.num_local_cells, args.hash_seed, use_u16, pbar).unwrap()
         });
     }
     threadpool.join();
@@ -457,9 +510,17 @@ fn main() {
 
 
     // Step 3: For each local cell, group into outputs of wds chunk size
+    // Create cascade of overflow writers 
+    let overflow_reduction = 16;
+    let mut total_calls = 0;
+    let mut remaining_files = 128;
+    while remaining_files  > 0 {
+        total_calls += remaining_files;
+        remaining_files = remaining_files / overflow_reduction;
+    }
 
     println!("Starting fineSort/upload loop...");
-    let pbar = ProgressBar::new(1 + args.num_local_cells as u64)
+    let pbar = ProgressBar::new(total_calls as u64)
         .with_style(
             ProgressStyle::with_template(
                 "Files {human_pos}/{human_len} [{elapsed_precise}/{duration_precise}] [{wide_bar:.cyan/blue}]",
@@ -467,35 +528,51 @@ fn main() {
         );
     let pbar = Arc::new(Mutex::new(pbar));
     pbar.lock().unwrap().inc(0); // Makes pbar show up with 0/N files complete
-    let threadpool = ThreadPool::new(threads);    
-    let overflow_filename  = args.local_cell_dir.clone().join("overflow.u32");
+
+
+
     let wds_chunk_id = Arc::new(AtomicUsize::new(0));
     let total_token_count = Arc::new(AtomicUsize::new(0));
-    let overflow_writer = Arc::new(
-            Mutex::new(
-            BufWriter::new(
-            OpenOptions::new()
-            .append(true)
-            .create(true)
-            .open(overflow_filename.clone())
-            .unwrap()
-        )));
-    for fid in 0..args.num_local_cells {
-        let filename = local_cell_id(&args.local_cell_dir, fid);
-        let overflow = Arc::clone(&overflow_writer);
-        let output_dir = args.output.clone();
-        let wds_chunk_id = wds_chunk_id.clone();
-        let total_token_count = total_token_count.clone();
-        let pbar = pbar.clone();
-        threadpool.execute(move || {
-            process_local_cell(&filename, Some(overflow), &output_dir, args.wds_chunk_size, &wds_chunk_id, &total_token_count, pbar).unwrap()
-        });
-    }
-    threadpool.join();
-    overflow_writer.lock().unwrap().flush().unwrap();
+    let mut overflow_round = 0;
+    let mut num_overflows = args.num_local_cells / overflow_reduction;
+    let mut src_filenames: Vec<PathBuf> = (0..args.num_local_cells)
+        .map(|idx| local_cell_id(&args.local_cell_dir, idx)).collect();
+
+    while src_filenames.len() > 0 {
+
+        let threadpool = ThreadPool::new(threads);    
+        let (overflow_writers, overflow_filenames) = build_overflow_writers(&args.local_cell_dir, overflow_round, num_overflows);
+        println!("STARTING ROUND {:?} | {:?} SRC FILES | {:?} WRITERS",
+                 overflow_round, src_filenames.len(), overflow_filenames.len());        
+        let src_pointer = &src_filenames;
+        for filename in src_pointer {     
+            let filename = filename.clone();       
+            let output_dir = args.output.clone();
+            let wds_chunk_id = wds_chunk_id.clone();
+            let total_token_count = total_token_count.clone();
+            let overflow_writers = overflow_writers.clone();
+            let pbar = pbar.clone();
+            threadpool.execute(move || {
+                process_local_cell(&filename, &overflow_writers, &output_dir, args.wds_chunk_size, &wds_chunk_id,
+                                   &total_token_count, use_u16, args.hash_seed, pbar).unwrap()
+            });                        
+        } 
+        threadpool.join();
+        overflow_round += 1;
+        if num_overflows == 1 {
+            num_overflows = 0;
+        } else {
+            num_overflows = num_overflows / overflow_reduction;
+            if num_overflows == 0 {
+                num_overflows = 1;
+            }
+        }
+        src_filenames = overflow_filenames.clone();
+    };
+    
+
 
     // Step 4: Finalize by finishing the overflow writer, and writing some stats
-    process_local_cell(&overflow_filename, None, &args.output, args.wds_chunk_size, &wds_chunk_id, &total_token_count, pbar).unwrap();
     println!("Finishing tokenize shuffle run!");
     println!("-------------------------------");
     println!("Ran in {:?} (s)", start_time.elapsed().as_secs());
