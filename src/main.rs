@@ -710,24 +710,16 @@ fn main() {
 
     let mut final_histogram = input_files
         .par_iter()
-        .map(|f| {collect_url_histogram(f, pbar.clone()).unwrap()})
-        .fold(|| HashMap::new(), |mut acc, local_histogram| {
-            for (word, count) in local_histogram {
-                *acc.entry(word).or_insert(0) += count;
-            }
-            pbar.lock().unwrap().inc(1);
-            acc
-        })
+        .map(|f| {collect_url_contains(f, url_hashes.clone(), pbar.clone()).unwrap()})
         .reduce(HashMap::new, |mut acc, local_histogram| {
-            for (word, count) in local_histogram {
-                *acc.entry(word).or_insert(0) += count;
+            for (k, text_vec) in local_histogram {
+                acc.entry(k).or_insert_with(Vec::new).extend(text_vec);
             }
             pbar.lock().unwrap().inc(1);            
             acc
         });
 
 
-    final_histogram.retain(|_, &mut value| value > 1);
 
     let serialized = serde_json::to_string(&final_histogram).unwrap();
     let mut file = File::create(args.output).unwrap();
