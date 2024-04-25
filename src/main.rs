@@ -157,7 +157,7 @@ fn setup_local_cell_mapper(local_cell_dir: &PathBuf, num_local_cells:usize) ->  
 }
     
 
-fn hash_vec<T>(vec: Vec<T>, seed: usize) -> u64 where T: Hash {
+fn hash_vec<T>(vec: &Vec<T>, seed: usize) -> u64 where T: Hash {
     // Hashes a vector of u16s into a u64 hash value
     let mut hasher = DefaultHasher::new();
     seed.hash(&mut hasher);
@@ -165,11 +165,11 @@ fn hash_vec<T>(vec: Vec<T>, seed: usize) -> u64 where T: Hash {
     hasher.finish()
 }
 
-fn vecu32_to_vecu16(vec_u32: Vec<u32>) -> Result<Vec<u16>, TryFromIntError> {
+fn vecu32_to_vecu16(vec_u32: &Vec<u32>) -> Result<Vec<u16>, TryFromIntError> {
     // Casts a vector of u32s to u16s, and if any element explodes, the whole fxn should err
     let x = vec_u32
         .into_iter()
-        .map(|x| u16::try_from(x))
+        .map(|x| u16::try_from(*x))
         .collect::<Result<Vec<u16>, TryFromIntError>>();
     x
 }
@@ -286,11 +286,11 @@ fn tokenize_semishuffle_file(reader: BufReader<Cursor<Vec<u8>>>, local_cell_mapp
             let padding_size = seqlen - context.len();
             context.extend(vec![padding_token_id; padding_size]);
         }
-        let local_cell_fid = (hash_vec(context.clone(), hash_seed) % num_local_cells as u64) as usize;
+        let local_cell_fid = (hash_vec(&context, hash_seed) % num_local_cells as u64) as usize;
         let mut writer = local_cell_mapper.get(&local_cell_fid).unwrap().lock().unwrap();
 
         if use_u16 {
-            let context = vecu32_to_vecu16(context).unwrap();
+            let context = vecu32_to_vecu16(&context).unwrap();
             serialize_into(&mut *writer, &context).unwrap();
         }
         else {
@@ -426,10 +426,10 @@ fn process_local_cell(filename: &PathBuf, overflow_writer: &Option<HashMap<usize
             let num_overflows = overflow_writer.as_ref().unwrap().len() as u64;
             let overflow_writer = overflow_writer.as_ref().unwrap();
             for context in chunk {
-                let context_hash = hash_vec::<u32>(context.clone(), hash_seed);
+                let context_hash = hash_vec::<u32>(&context, hash_seed);
                 let mut writer = overflow_writer.get(&((context_hash % num_overflows) as usize)).unwrap().lock().unwrap();
                 if use_u16 {
-                    let context = vecu32_to_vecu16(context.clone()).unwrap();
+                    let context = vecu32_to_vecu16(context).unwrap();
                     serialize_into(&mut *writer, &context).unwrap();
                 }
                 else {
