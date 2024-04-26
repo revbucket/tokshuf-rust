@@ -35,6 +35,10 @@ use flate2::Compression;
 use zstd::stream::read::Decoder as ZstdDecoder;
 use serde::de::DeserializeOwned;
 use tiktoken_rs::p50k_base;
+use tiktoken_rs::tokenizer::{get_tokenizer, Tokenizer as OtherTokenizer};
+use tiktoken_rs::tokenizer::*;
+use tiktoken_rs::*;
+use tiktoken_rs::CoreBPE;
 pub mod s3;
 
 /*======================================================
@@ -368,8 +372,9 @@ fn count_tokens_tiktoken(input_file: &PathBuf, tokenizer_name: String, token_cou
 
 
 
-    let bpe = p50k_base().unwrap();
-
+    //let bpe = p50k_base().unwrap();
+    let bpe = get_bpe_from_model("gpt-4")?;
+    //let bpe = get_tokenizer(tokenizer_name.as_str()).unwrap();
     // Tokenize all lines in the file
     let mut all_tokens = Vec::new();
     for line in reader.lines() {
@@ -388,6 +393,16 @@ fn count_tokens_tiktoken(input_file: &PathBuf, tokenizer_name: String, token_cou
     Ok(())
 }
 
+pub fn get_bpe_from_model(model: &str) -> Result<CoreBPE> {
+    let tokenizer = get_tokenizer(model).unwrap();
+    match tokenizer {
+        OtherTokenizer::Cl100kBase => cl100k_base(),
+        OtherTokenizer::R50kBase => r50k_base(),
+        OtherTokenizer::P50kBase => p50k_base(),
+        OtherTokenizer::P50kEdit => p50k_edit(),
+        OtherTokenizer::Gpt2 => r50k_base(),
+    }
+}
 
 
 /*======================================================
