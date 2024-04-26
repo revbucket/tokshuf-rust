@@ -34,7 +34,7 @@ use flate2::write::GzEncoder;
 use flate2::Compression;
 use zstd::stream::read::Decoder as ZstdDecoder;
 use serde::de::DeserializeOwned;
-
+use tiktoken_rs::p50k_base;
 pub mod s3;
 
 /*======================================================
@@ -49,11 +49,11 @@ struct Args {
     input: Vec<PathBuf>,
 
     /// Local directory (need not exist yet) where local cells will exist/grow
-    #[arg(required=true, long)]
+    #[arg(long)]
     local_cell_dir: PathBuf,
 
     /// Output location (may be an s3 uri)
-    #[arg(required=true, long)]
+    #[arg(long)]
     output: PathBuf,
 
     /// Which tokenizer we want to use by default 
@@ -301,6 +301,95 @@ fn tokenize_semishuffle_file(reader: BufReader<Cursor<Vec<u8>>>, local_cell_mapp
 }
 
 
+
+fn count_tokens(input_file: &PathBuf, tokenizer_name: String, token_count: &AtomicUsize) -> Result<(), Error> {
+    // For a reader, will tokenize each line, build contexts, and put each context into the appropriate local cell
+    // Load tokenizer
+
+    let reader = if is_s3(input_file) {
+        let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();   
+        match rt.block_on(get_reader_from_s3(input_file, Some(5))) {
+            Ok(result) => result,
+            Err(err) => {
+                eprintln!("Error! {:?}", err);
+                return Err(err.into());
+            }
+        }
+    } else {
+        let contents = read_file_into_memory(input_file).expect("Failed to read contents into memory");
+        BufReader::new(contents)
+    };
+
+
+    let tokenizer = load_tokenizer(&tokenizer_name).unwrap();
+
+    // Tokenize all lines in the file
+    let mut all_tokens = Vec::new();
+    for line in reader.lines() {
+        let line = line?;
+        let json: Value = serde_json::from_str(&line)?;
+        let text = json["text"].as_str().unwrap();
+
+        let encoded = tokenizer.encode(text, false).unwrap();
+        let mut tokens = encoded.get_ids().to_vec();
+        tokens.push(tokenizer.token_to_id("<EOT>").unwrap());
+        all_tokens.extend(tokens);       
+    }
+
+    token_count.fetch_add(all_tokens.len(), Ordering::SeqCst);
+    Ok(())
+}
+
+
+fn count_tokens_tiktoken(input_file: &PathBuf, tokenizer_name: String, token_counter: &AtomicUsize) -> Result<(), Error> {
+    // For a reader, will tokenize each line, build contexts, and put each context into the appropriate local cell
+    // Load tokenizer
+    //let tokenizer = load_tokenizer(&tokenizer_name).unwrap();
+
+    let reader = if is_s3(input_file) {
+        let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();   
+        match rt.block_on(get_reader_from_s3(input_file, Some(5))) {
+            Ok(result) => result,
+            Err(err) => {
+                eprintln!("Error! {:?}", err);
+                return Err(err.into());
+            }
+        }
+    } else {
+        let contents = read_file_into_memory(input_file).expect("Failed to read contents into memory");
+        BufReader::new(contents)
+    };
+
+
+
+    let bpe = p50k_base().unwrap();
+
+    // Tokenize all lines in the file
+    let mut all_tokens = Vec::new();
+    for line in reader.lines() {
+        let line = line?;
+        let json: Value = serde_json::from_str(&line)?;
+        let text = json["text"].as_str().unwrap();
+
+        //let encoded = tokenizer.encode(text, false).unwrap();
+        //let mut tokens = encoded.get_ids().to_vec();
+        let tokens = bpe.encode_with_special_tokens(text);
+        //tokens.push(tokenizer.token_to_id("<EOT>").unwrap());
+        all_tokens.extend(tokens);       
+    }
+
+    token_counter.fetch_add(all_tokens.len(), Ordering::SeqCst);
+    Ok(())
+}
+
+
+
 /*======================================================
 =                 Final shuffle code                   =
 ======================================================*/
@@ -466,8 +555,9 @@ fn main() {
     } else {
         args.threads
     };
-    let mut local_cell_mapper = setup_local_cell_mapper(&args.local_cell_dir, args.num_local_cells);
+    //let mut local_cell_mapper = setup_local_cell_mapper(&args.local_cell_dir, args.num_local_cells);
     let mut input_files = expand_dirs(args.input).unwrap();
+    input_files.truncate(16);
 
     let vocab_size = load_tokenizer(&args.tokenizer).unwrap().get_vocab_size(true);
     let use_u16 = vocab_size < 65536;
@@ -487,83 +577,19 @@ fn main() {
 
     // Step 2: Tokenize each document, make contexts, and put contexts into local cells
     println!("Starting tokenize/coarseSort loop...");
+    let total_token_count = Arc::new(AtomicUsize::new(0));
     for input_file in input_files {
         let input_file = input_file.clone();
         let tokenizer_name = args.tokenizer.clone();
-        let local_cell_mapper = local_cell_mapper.clone();
+        let total_token_count = total_token_count.clone();
         let pbar = pbar.clone();
         threadpool.execute(move || {
-            process_input_file(&input_file, &local_cell_mapper, args.seqlen, tokenizer_name,
-                               args.num_local_cells, args.hash_seed, use_u16, pbar).unwrap()
+            count_tokens_tiktoken(&input_file, tokenizer_name, &total_token_count).unwrap();
+
+            pbar.lock().unwrap().inc(1);            
         });
     }
     threadpool.join();
-    for (_, writer) in local_cell_mapper.iter_mut() {
-        writer.lock().unwrap().flush().unwrap();
-    }
-
-
-    // Step 3: For each local cell, group into outputs of wds chunk size
-    // Create cascade of overflow writers 
-    let overflow_reduction = 16;
-    let mut total_calls = 0;
-    let mut remaining_files = 128;
-    while remaining_files  > 0 {
-        total_calls += remaining_files;
-        remaining_files = remaining_files / overflow_reduction;
-    }
-
-    println!("Starting fineSort/upload loop...");
-    let pbar = ProgressBar::new(total_calls as u64)
-        .with_style(
-            ProgressStyle::with_template(
-                "Files {human_pos}/{human_len} [{elapsed_precise}/{duration_precise}] [{wide_bar:.cyan/blue}]",
-            ).unwrap()
-        );
-    let pbar = Arc::new(Mutex::new(pbar));
-    pbar.lock().unwrap().inc(0); // Makes pbar show up with 0/N files complete
-
-
-
-    let wds_chunk_id = Arc::new(AtomicUsize::new(0));
-    let total_token_count = Arc::new(AtomicUsize::new(0));
-    let mut overflow_round = 0;
-    let mut num_overflows = args.num_local_cells / overflow_reduction;
-    let mut src_filenames: Vec<PathBuf> = (0..args.num_local_cells)
-        .map(|idx| local_cell_id(&args.local_cell_dir, idx)).collect();
-
-    while src_filenames.len() > 0 {
-
-        let threadpool = ThreadPool::new(threads);    
-        let (overflow_writers, overflow_filenames) = build_overflow_writers(&args.local_cell_dir, overflow_round, num_overflows);
-        println!("STARTING ROUND {:?} | {:?} SRC FILES | {:?} WRITERS",
-                 overflow_round, src_filenames.len(), overflow_filenames.len());        
-        let src_pointer = &src_filenames;
-        for filename in src_pointer {     
-            let filename = filename.clone();       
-            let output_dir = args.output.clone();
-            let wds_chunk_id = wds_chunk_id.clone();
-            let total_token_count = total_token_count.clone();
-            let overflow_writers = overflow_writers.clone();
-            let pbar = pbar.clone();
-            threadpool.execute(move || {
-                process_local_cell(&filename, &overflow_writers, &output_dir, args.wds_chunk_size, &wds_chunk_id,
-                                   &total_token_count, use_u16, args.hash_seed, pbar).unwrap()
-            });                        
-        } 
-        threadpool.join();
-        overflow_round += 1;
-        if num_overflows == 1 {
-            num_overflows = 0;
-        } else {
-            num_overflows = num_overflows / overflow_reduction;
-            if num_overflows == 0 {
-                num_overflows = 1;
-            }
-        }
-        src_filenames = overflow_filenames.clone();
-    };
-    
 
 
     // Step 4: Finalize by finishing the overflow writer, and writing some stats
@@ -571,6 +597,6 @@ fn main() {
     println!("-------------------------------");
     println!("Ran in {:?} (s)", start_time.elapsed().as_secs());
     println!("Processed {:?} tokens", total_token_count.fetch_add(0, Ordering::SeqCst));
-
+    println!("Tok/s/cpu: {:?}", (total_token_count.fetch_add(0, Ordering::SeqCst) as u64) / (threads as u64 * start_time.elapsed().as_secs()) as u64);
 
 }
