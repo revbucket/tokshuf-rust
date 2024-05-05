@@ -32,7 +32,11 @@ use flate2::write::GzEncoder;
 use flate2::Compression;
 use zstd::stream::read::Decoder as ZstdDecoder;
 use serde::de::DeserializeOwned;
+use base64::{engine::general_purpose, Engine as _};
 
+use rustc_hash::FxHashMap;
+
+use tiktoken_rs::CoreBPE;
 pub mod s3;
 
 const EOT_TOKEN: i32 = 0;
@@ -84,6 +88,10 @@ struct Args {
     // How many times to retry s3 operations
     #[arg(long, default_value_t=3)]
     s3_retries: usize,
+
+    // If present, we use tiktoken to encode (only works with "EleutherAI/gpt-neox-20b"!)
+    #[arg(long, default_value_t=false)]
+    use_tiktoken: bool,
 
 }
 
@@ -226,13 +234,37 @@ fn load_tokenizer(tokenizer_name: &String) -> Result<Tokenizer> {
 }
 
 
+fn load_tiktoken_tokenizer(tokenizer_name: &String) -> Result<CoreBPE> {
+
+    assert!(tokenizer_name == "EleutherAI/gpt-neox-20b");
+
+    let eleuther = include_str!("../EleutherAI_gpt-neox-20b.tiktoken");
+    let mut encoder = FxHashMap::default();
+
+    for line in eleuther.lines() {
+        let mut parts = line.split(' ');
+        let raw = parts.next().unwrap();
+        let token = &general_purpose::STANDARD.decode(raw)?;
+        let rank: usize = parts.next().unwrap().parse().unwrap();
+        encoder.insert(token.clone(), rank);        
+    }
+    let special_tokens = FxHashMap::default();
+    let bpe = CoreBPE::new(
+        encoder, 
+        special_tokens,
+        r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+",
+        )?;
+
+    Ok(bpe)
+}
+
 
 /*======================================================
 =              Tokenize/semishuffle code               =
 ======================================================*/
 
 fn process_input_file(input_file: &PathBuf, local_cell_mapper: &HashMap<usize, Arc<Mutex<BufWriter<File>>>>, 
-                      seqlen: usize, tokenizer_name: String, num_local_cells: usize, hash_seed: usize,
+                      seqlen: usize, tokenizer_name: String, num_local_cells: usize, hash_seed: usize, use_tiktoken: bool,
                       pbar: Arc<Mutex<ProgressBar>>) -> Result<(), Error> {
     // Gather file into reader 
 
@@ -252,7 +284,7 @@ fn process_input_file(input_file: &PathBuf, local_cell_mapper: &HashMap<usize, A
         let contents = read_file_into_memory(input_file).expect("Failed to read contents into memory");
         BufReader::new(contents)
     };
-    match tokenize_semishuffle_file(reader, local_cell_mapper, seqlen, tokenizer_name, num_local_cells, hash_seed) {
+    match tokenize_semishuffle_file(reader, local_cell_mapper, seqlen, tokenizer_name, num_local_cells, hash_seed, use_tiktoken) {
         Ok(_) => {
             pbar.lock().unwrap().inc(1);
             return Ok(());
@@ -265,26 +297,44 @@ fn process_input_file(input_file: &PathBuf, local_cell_mapper: &HashMap<usize, A
 }
 
 
+fn tokenize_from_reader(reader: BufReader<Cursor<Vec<u8>>>, tokenizer_name: String, 
+                        use_tiktoken: bool) -> Result<Vec<i32>, Error> {
+    let mut all_tokens = Vec::new();
+    if use_tiktoken {
+        let tokenizer = load_tiktoken_tokenizer(&tokenizer_name)?;
+        for line in reader.lines() {
+            let line = line?;
+            let json: Value = serde_json::from_str(&line)?;
+            let text = json["text"].as_str().unwrap();
+            let encoded = tokenizer.encode_with_special_tokens(text);
+            let mut tokens = cast_vector::<usize, i32>(encoded).unwrap();
+            tokens.push(EOT_TOKEN);
+            all_tokens.extend(tokens);
+        }
+    } else {
+        let tokenizer = load_tokenizer(&tokenizer_name).unwrap();
+        for line in reader.lines() {
+            let line = line?;
+            let json: Value = serde_json::from_str(&line)?;
+            let text = json["text"].as_str().unwrap();
+
+            let encoded = tokenizer.encode(text, false).unwrap();
+            let mut tokens = cast_vector::<u32, i32>(encoded.get_ids().to_vec()).unwrap();
+            tokens.push(EOT_TOKEN);
+            //tokens.push(tokenizer.token_to_id("<EOT>").unwrap());
+            all_tokens.extend(tokens);       
+        }        
+    }
+    Ok(all_tokens)
+}
+
+
 fn tokenize_semishuffle_file(reader: BufReader<Cursor<Vec<u8>>>, local_cell_mapper: &HashMap<usize, Arc<Mutex<BufWriter<File>>>>, 
                             seqlen: usize, tokenizer_name: String, num_local_cells: usize, 
-                            hash_seed: usize) -> Result<(), Error> {
+                            hash_seed: usize, use_tiktoken: bool) -> Result<(), Error> {
     // For a reader, will tokenize each line, build contexts, and put each context into the appropriate local cell
-    // Load tokenizer
-    let tokenizer = load_tokenizer(&tokenizer_name).unwrap();
+    let all_tokens = tokenize_from_reader(reader, tokenizer_name, use_tiktoken).unwrap();
 
-    // Tokenize all lines in the file
-    let mut all_tokens = Vec::new();
-    for line in reader.lines() {
-        let line = line?;
-        let json: Value = serde_json::from_str(&line)?;
-        let text = json["text"].as_str().unwrap();
-
-        let encoded = tokenizer.encode(text, false).unwrap();
-        let mut tokens = cast_vector::<u32, i32>(encoded.get_ids().to_vec()).unwrap();
-        tokens.push(EOT_TOKEN);
-        //tokens.push(tokenizer.token_to_id("<EOT>").unwrap());
-        all_tokens.extend(tokens);       
-    }
     // Group tokens into contexts of length seqlen
     // And then figure out where each group should live and append it to that file
     for chunk in all_tokens.chunks(seqlen) {
@@ -300,6 +350,7 @@ fn tokenize_semishuffle_file(reader: BufReader<Cursor<Vec<u8>>>, local_cell_mapp
 
     Ok(())
 }
+
 
 
 /*======================================================
@@ -480,7 +531,7 @@ fn main() {
         let pbar = pbar.clone();
         threadpool.execute(move || {
             process_input_file(&input_file, &local_cell_mapper, args.seqlen, tokenizer_name,
-                               args.num_local_cells, args.hash_seed, pbar).unwrap()
+                               args.num_local_cells, args.hash_seed, args.use_tiktoken, pbar).unwrap()
         });
     }
     threadpool.join();
