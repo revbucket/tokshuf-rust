@@ -60,7 +60,7 @@ struct Args {
     #[arg(required=true, long)]
     output: PathBuf,
 
-    /// Which tokenizer we want to use by default 
+    /// Which tokenizer we want to use by default // other option is "meta-llama/Meta-Llama-3-8B"
     #[arg(long, default_value_t=String::from("EleutherAI/gpt-neox-20b"))]
     tokenizer: String,
 
@@ -244,7 +244,7 @@ fn load_tiktoken_tokenizer(tokenizer_name: &String) -> Result<CoreBPE> {
         }  
         "meta-llama/Meta-Llama-3-8B" => {
             (r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
-             include_str!("../meta-llama-3-8b.tiktoken"))
+             include_str!("../meta-llama-3-8B.tiktoken"))
         }
         _ => {
             return Err(anyhow!("Unknown tokenizer name: {}", tokenizer_name));
