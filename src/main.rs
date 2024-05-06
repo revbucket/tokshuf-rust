@@ -236,12 +236,25 @@ fn load_tokenizer(tokenizer_name: &String) -> Result<Tokenizer> {
 
 fn load_tiktoken_tokenizer(tokenizer_name: &String) -> Result<CoreBPE> {
 
-    assert!(tokenizer_name == "EleutherAI/gpt-neox-20b");
 
-    let eleuther = include_str!("../EleutherAI_gpt-neox-20b.tiktoken");
+    let (pattern, tiktoken_data) = match (*tokenizer_name).as_str() {
+        "EleutherAI/gpt-neox-20b" => {
+            (r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+",
+             include_str!("../EleutherAI_gpt-neox-20b.tiktoken"))
+        }  
+        "meta-llama/Meta-Llama-3-8B" => {
+            (r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
+             include_str!("../meta-llama-3-8b.tiktoken"))
+        }
+        _ => {
+            return Err(anyhow!("Unknown tokenizer name: {}", tokenizer_name));
+        }
+    };
+
+
     let mut encoder = FxHashMap::default();
 
-    for line in eleuther.lines() {
+    for line in tiktoken_data.lines() {
         let mut parts = line.split(' ');
         let raw = parts.next().unwrap();
         let token = &general_purpose::STANDARD.decode(raw)?;
@@ -252,7 +265,7 @@ fn load_tiktoken_tokenizer(tokenizer_name: &String) -> Result<CoreBPE> {
     let bpe = CoreBPE::new(
         encoder, 
         special_tokens,
-        r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+",
+        pattern,
         )?;
 
     Ok(bpe)
