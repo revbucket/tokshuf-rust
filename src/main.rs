@@ -2,7 +2,7 @@
 use std::io::Read;
 use std::time::Instant;
 use anyhow::{anyhow, bail, Result, Error};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::convert::TryFrom;
 use glob::glob;
@@ -46,54 +46,157 @@ const PAD_TOKEN: i32 = -1;
 ======================================================*/
 // Args 
 
-#[derive(Parser, Debug)]
-struct Args {
-    /// (List of) directories/files (on s3 or local) that are jsonl.gz or jsonl.zstd files
-    #[arg(required=true, long)]
-    input: Vec<PathBuf>,
+#[derive(Parser)]
+#[clap(author, version, about, long_about = None)]
+struct ArgParser {
+    #[clap(subcommand)]
+    command: Commands,
+}
 
-    /// Local directory (need not exist yet) where local cells will exist/grow
-    #[arg(required=true, long)]
-    local_cell_dir: PathBuf,
 
-    /// Output location (may be an s3 uri)
-    #[arg(required=true, long)]
-    output: PathBuf,
+#[derive(Subcommand, Debug)]
+enum Commands {
+    #[clap(arg_required_else_help = true)]
+    Tokshuf {
+        /// (List of) directories/files (on s3 or local) that are jsonl.gz or jsonl.zstd files
+        #[arg(required=true, long)]
+        input: Vec<PathBuf>,
 
-    /// Which tokenizer we want to use by default // other option is "meta-llama/Meta-Llama-3-8B"
-    #[arg(long, default_value_t=String::from("EleutherAI/gpt-neox-20b"))]
-    tokenizer: String,
+        /// Local directory (need not exist yet) where local cells will exist/grow
+        #[arg(required=true, long)]
+        local_cell_dir: PathBuf,
 
-    /// How long each context is (in tokens)
-    #[arg(long, default_value_t=2049)]
-    seqlen: usize,
+        /// Output location (may be an s3 uri)
+        #[arg(required=true, long)]
+        output: PathBuf,
 
-    /// Size of the webdataset chunk size (in contexts)
-    #[arg(long, default_value_t=8192)]
-    wds_chunk_size: usize,
+        /// Which tokenizer we want to use by default // other option is "meta-llama/Meta-Llama-3-8B"
+        #[arg(long, default_value_t=String::from("EleutherAI/gpt-neox-20b"))]
+        tokenizer: String,
 
-    /// How many threads to use (default is max available)
-    #[arg(long, default_value_t=0)]
-    threads: usize,
+        /// How long each context is (in tokens)
+        #[arg(long, default_value_t=2049)]
+        seqlen: usize,
 
-    /// How many local cells we have. 
-    /// IMPORTANT: This should probably be 
-    #[arg(long, default_value_t=128)]
-    num_local_cells: usize,
+        /// Size of the webdataset chunk size (in contexts)
+        #[arg(long, default_value_t=8192)]
+        wds_chunk_size: usize,
 
-    /// Seed to use for the hashing of documents
-    #[arg(long, default_value_t=1234)]
-    hash_seed: usize,
+        /// How many threads to use (default is max available)
+        #[arg(long, default_value_t=0)]
+        threads: usize,
 
-    // How many times to retry s3 operations
-    #[arg(long, default_value_t=3)]
-    s3_retries: usize,
+        /// How many local cells we have. 
+        /// IMPORTANT: This should probably be 
+        #[arg(long, default_value_t=128)]
+        num_local_cells: usize,
 
-    // If present, we use tiktoken to encode (only works with "EleutherAI/gpt-neox-20b"!)
-    #[arg(long, default_value_t=false)]
-    use_tiktoken: bool,
+        /// Seed to use for the hashing of documents
+        #[arg(long, default_value_t=1234)]
+        hash_seed: usize,
+
+        /// How many times to retry s3 operations
+        #[arg(long, default_value_t=3)]
+        s3_retries: usize,
+
+        /// If present, we use tiktoken to encode (only works with "EleutherAI/gpt-neox-20b"!)
+        #[arg(long, default_value_t=false)]
+        use_tiktoken: bool,        
+
+    },
+
+        Tok {
+        /// (List of) directories/files (on s3 or local) that are jsonl.gz or jsonl.zstd files
+        #[arg(required=true, long)]
+        input: Vec<PathBuf>,
+
+        /// Local directory (need not exist yet) where local cells will exist/grow
+        #[arg(required=true, long)]
+        local_cell_dir: PathBuf,
+
+        /// Output location (may be an s3 uri)
+        #[arg(required=true, long)]
+        output: PathBuf,
+
+        /// Which tokenizer we want to use by default // other option is "meta-llama/Meta-Llama-3-8B"
+        #[arg(long, default_value_t=String::from("EleutherAI/gpt-neox-20b"))]
+        tokenizer: String,
+
+        /// How long each context is (in tokens)
+        #[arg(long, default_value_t=2049)]
+        seqlen: usize,
+
+
+        /// How many threads to use (default is max available)
+        #[arg(long, default_value_t=0)]
+        threads: usize,
+
+        /// How many local cells we have. 
+        /// IMPORTANT: This should probably be 
+        #[arg(long, default_value_t=128)]
+        num_local_cells: usize,
+
+        /// Seed to use for the hashing of documents
+        #[arg(long, default_value_t=1234)]
+        hash_seed: usize,
+
+        /// How many times to retry s3 operations
+        #[arg(long, default_value_t=3)]
+        s3_retries: usize,
+
+        /// If present, we use tiktoken to encode (only works with "EleutherAI/gpt-neox-20b"!)
+        #[arg(long, default_value_t=false)]
+        use_tiktoken: bool,        
+
+        /// Number of shards to use 
+        #[arg(long, default_value_t=1)]
+        num_shards: usize,
+
+        /// Which shard this is
+        #[arg(long, default_value_t=0)]
+        shard_num: usize,
+
+    },
+
+    Shuf {
+        /// (List of) directories/files (on s3 or local) that are jsonl.gz or jsonl.zstd files
+        #[arg(required=true, long)]
+        input: Vec<PathBuf>,
+
+        /// Local directory (need not exist yet) where local cells will exist/grow
+        #[arg(required=true, long)]
+        local_cell_dir: PathBuf,
+
+        /// Output location (may be an s3 uri)
+        #[arg(required=true, long)]
+        output: PathBuf,
+
+        /// Size of the webdataset chunk size (in contexts)
+        #[arg(long, default_value_t=8192)]
+        wds_chunk_size: usize,
+
+        /// How many threads to use (default is max available)
+        #[arg(long, default_value_t=0)]
+        threads: usize,
+
+        /// How many local cells we have. 
+        /// IMPORTANT: This should probably be 
+        #[arg(long, default_value_t=128)]
+        num_local_cells: usize,
+
+        /// Seed to use for the hashing of documents
+        #[arg(long, default_value_t=1234)]
+        hash_seed: usize,
+
+        /// How many times to retry s3 operations
+        #[arg(long, default_value_t=3)]
+        s3_retries: usize,
+
+    },
 
 }
+
+
 
 
 pub(crate) fn expand_dirs(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
@@ -502,12 +605,55 @@ fn process_local_cell(filename: &PathBuf, overflow_writer: &Option<HashMap<usize
     Ok(())
 }
 
+
+fn process_multiple_cells(remote_cells: Vec<&PathBuf>, overflow_writer: &HashMap<usize, Arc<Mutex<BufWriter<File>>>>, 
+                          output_dir: &PathBuf, wds_chunk_size: &AtomicUsize, total_token_count: &AtomicUsize,
+                          hash_seed: usize, pbar: Arc<Mutex<ProgressBar>>) -> Result<()> {
+    Ok(())
+}
+
 /*======================================================
 =                     Main block                       =
 ======================================================*/
 
 
-fn main() {
+async fn main() -> Result<()> {
+    let args = ArgParser::parse();
+
+    match &args.command {
+        Commands::Tokshuf {input, local_cell_dir, output, tokenizer,
+                           seqlen, wds_chunk_size, threads, num_local_cells,
+                           hash_seed, s3_retries, use_tiktoken} =>
+        {
+            tokshuf(*input, *local_cell_dir, *output, *tokenizer, *seqlen,
+                    *wds_chunk_size, *threads, *num_local_cells, *hash_seed,
+                    *s3_retries, *use_tiktoken);
+        },
+
+        Commands::Tok {input, local_cell_dir, output, tokenizer, seqlen,
+                       threads, num_local_cells, hash_seed, s3_retries,
+                       use_tiktoken, num_shards, shard_num} => {
+            tok(*input, *local_cell_dir, *output, *tokenizer, *seqlen,
+                *threads, *num_local_cells, *hash_seed, *s3_retries,
+                *use_tiktoken, *num_shards, *shard_num);
+        },
+
+        Commands::Shuf {input, local_cell_dir, output,
+                        wds_chunk_size, threads, num_local_cells, hash_seed, s3_retries,
+                        } => {
+            shuf(*input, *local_cell_dir, *output, *wds_chunk_size, *threads,
+                 *num_local_cells, *hash_seed, *s3_retries);
+        },
+    }
+    Ok(())
+}
+
+
+
+fn tokshuf(input: Vec<PathBuf>, local_cell_dir: PathBuf, output: PathBuf,
+           tokenizer: String, seqlen: usize, wds_chunk_size: usize,
+           threads: usize, num_local_cells: usize, hash_seed: usize, 
+           s3_retries: usize, use_tiktoken: bool) -> Result<()> {
 
     // Step 1: Setup phase: parse args and set up the:
     //    - files to tokshuf
@@ -515,14 +661,13 @@ fn main() {
     //    - threadpool
     println!("Setting up Tok/Shuffle run");
     let start_time = Instant::now();    
-    let args = Args::parse();
-    let threads = if args.threads == 0 {
+    let threads = if threads == 0 {
         available_parallelism().unwrap().get()
     } else {
-        args.threads
+        threads
     };
-    let mut local_cell_mapper = setup_local_cell_mapper(&args.local_cell_dir, args.num_local_cells);
-    let input_files = expand_dirs(args.input).unwrap();
+    let mut local_cell_mapper = setup_local_cell_mapper(&local_cell_dir, num_local_cells);
+    let input_files = expand_dirs(input).unwrap();
 
     let pbar = ProgressBar::new(input_files.len() as u64)
         .with_style(
@@ -539,12 +684,12 @@ fn main() {
     println!("Starting tokenize/coarseSort loop...");
     for input_file in input_files {
         let input_file = input_file.clone();
-        let tokenizer_name = args.tokenizer.clone();
+        let tokenizer_name = tokenizer.clone();
         let local_cell_mapper = local_cell_mapper.clone();
         let pbar = pbar.clone();
         threadpool.execute(move || {
-            process_input_file(&input_file, &local_cell_mapper, args.seqlen, tokenizer_name,
-                               args.num_local_cells, args.hash_seed, args.use_tiktoken, pbar).unwrap()
+            process_input_file(&input_file, &local_cell_mapper, seqlen, tokenizer_name,
+                               num_local_cells, hash_seed, use_tiktoken, pbar).unwrap()
         });
     }
     threadpool.join();
@@ -578,27 +723,27 @@ fn main() {
     let wds_chunk_id = Arc::new(AtomicUsize::new(0));
     let total_token_count = Arc::new(AtomicUsize::new(0));
     let mut overflow_round = 0;
-    let mut num_overflows = args.num_local_cells / overflow_reduction;
-    let mut src_filenames: Vec<PathBuf> = (0..args.num_local_cells)
-        .map(|idx| local_cell_id(&args.local_cell_dir, idx)).collect();
+    let mut num_overflows = num_local_cells / overflow_reduction;
+    let mut src_filenames: Vec<PathBuf> = (0..num_local_cells)
+        .map(|idx| local_cell_id(&local_cell_dir, idx)).collect();
 
     while src_filenames.len() > 0 {
 
         let threadpool = ThreadPool::new(threads);    
-        let (overflow_writers, overflow_filenames) = build_overflow_writers(&args.local_cell_dir, overflow_round, num_overflows);
+        let (overflow_writers, overflow_filenames) = build_overflow_writers(&local_cell_dir, overflow_round, num_overflows);
         println!("STARTING ROUND {:?} | {:?} SRC FILES | {:?} WRITERS",
                  overflow_round, src_filenames.len(), overflow_filenames.len());        
         let src_pointer = &src_filenames;
         for filename in src_pointer {     
             let filename = filename.clone();       
-            let output_dir = args.output.clone();
+            let output_dir = output.clone();
             let wds_chunk_id = wds_chunk_id.clone();
             let total_token_count = total_token_count.clone();
             let overflow_writers = overflow_writers.clone();
             let pbar = pbar.clone();
             threadpool.execute(move || {
-                process_local_cell(&filename, &overflow_writers, &output_dir, args.wds_chunk_size, &wds_chunk_id,
-                                   &total_token_count, args.hash_seed, pbar).unwrap()
+                process_local_cell(&filename, &overflow_writers, &output_dir, wds_chunk_size, &wds_chunk_id,
+                                   &total_token_count, hash_seed, pbar).unwrap()
             });                        
         } 
         threadpool.join();
@@ -615,12 +760,183 @@ fn main() {
     };
     
 
-
     // Step 4: Finalize by finishing the overflow writer, and writing some stats
     println!("Finishing tokenize shuffle run!");
     println!("-------------------------------");
     println!("Ran in {:?} (s)", start_time.elapsed().as_secs());
     println!("Processed {:?} tokens", total_token_count.fetch_add(0, Ordering::SeqCst));
 
-
+    Ok(())
 }
+
+fn tok(input: Vec<PathBuf>, local_cell_dir: PathBuf, output: PathBuf, tokenizer: String, 
+       seqlen: usize, threads: usize, num_local_cells: usize, 
+       hash_seed: usize, s3_retries: usize, use_tiktoken: bool, num_shards: usize, 
+       shard_num: usize) -> Result<()> {
+    // TODO: DRY OUT CODE 
+
+    // Step 1: Setup phase: parse args and set up the:
+    //    - files to tokshuf
+    //    - local cells
+    //    - threadpool
+    println!("Setting up Tok/Shuffle run | TOKENIZE ONLY");
+    let start_time = Instant::now();    
+    let threads = if threads == 0 {
+        available_parallelism().unwrap().get()
+    } else {
+        threads
+    };
+    let mut local_cell_mapper = setup_local_cell_mapper(&local_cell_dir, num_local_cells);
+    let input_files = expand_dirs(input).unwrap();
+    let mut shard: Vec<PathBuf> = Vec::new();
+    let mut idx = shard_num;
+    while idx < input_files.len() {
+        shard.push(input_files[idx].clone());
+        idx += num_shards;
+    }    
+    let input_files = shard;
+
+    let pbar = ProgressBar::new(input_files.len() as u64)
+        .with_style(
+            ProgressStyle::with_template(
+                "Files {human_pos}/{human_len} [{elapsed_precise}/{duration_precise}] [{wide_bar:.cyan/blue}]",
+            ).unwrap()
+        );
+    let pbar = Arc::new(Mutex::new(pbar));
+    pbar.lock().unwrap().inc(0); // Makes pbar show up with 0/N files complete
+    let threadpool = ThreadPool::new(threads);
+
+
+    // Step 2: Tokenize each document, make contexts, and put contexts into local cells
+    println!("Starting tokenize/coarseSort loop...");
+    for input_file in input_files {
+        let input_file = input_file.clone();
+        let tokenizer_name = tokenizer.clone();
+        let local_cell_mapper = local_cell_mapper.clone();
+        let pbar = pbar.clone();
+        threadpool.execute(move || {
+            process_input_file(&input_file, &local_cell_mapper, seqlen, tokenizer_name,
+                               num_local_cells, hash_seed, use_tiktoken, pbar).unwrap()
+        });
+    }
+    threadpool.join();
+    for (_, writer) in local_cell_mapper.iter_mut() {
+        writer.lock().unwrap().flush().unwrap();
+    }
+
+    // Step 3: Upload into output 
+    let pbar = ProgressBar::new(num_local_cells as u64)
+        .with_style(
+            ProgressStyle::with_template(
+                "Files {human_pos}/{human_len} [{elapsed_precise}/{duration_precise}] [{wide_bar:.cyan/blue}]",
+            ).unwrap()
+        );
+    let pbar = Arc::new(Mutex::new(pbar));        
+    pbar.lock().unwrap().inc(0); // Makes pbar show up with 0/N files complete
+    let threadpool = ThreadPool::new(threads);
+
+
+    println!("Starting final upload...");
+    for cell_id in 0..num_local_cells {
+        let local_cell = local_cell_id(&local_cell_dir, cell_id);
+        let mut output_loc = output.clone();
+        output_loc.push(format!("cell_{:08}", cell_id));
+        output_loc.push(format!("shard_{:08}", shard_num.clone()));
+        let output_loc = PathBuf::new(); // TODO PROCESS OUTPUT 
+        let pbar = pbar.clone();
+        threadpool.execute(move || {
+            let data_cursor = read_file_into_memory(&local_cell).unwrap();
+            let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();   
+            rt.block_on(write_cursor_to_s3(&output_loc, data_cursor)).unwrap();
+        });
+    }
+
+    Ok(())
+}
+
+fn shuf(input: Vec<PathBuf>, local_cell_dir: PathBuf, output: PathBuf,
+        wds_chunk_size: usize, threads: usize, num_local_cells: usize, hash_seed: usize, s3_retries: usize) -> Result<()> {
+    println!("Setting up Tok/Shuffle run | TOKENIZE ONLY");
+    let input = input[0];    
+    let start_time = Instant::now();    
+    let threads = if threads == 0 {
+        available_parallelism().unwrap().get()
+    } else {
+        threads
+    };
+
+
+    let pbar = ProgressBar::new(num_local_cells as u64)
+        .with_style(
+            ProgressStyle::with_template(
+                "Files {human_pos}/{human_len} [{elapsed_precise}/{duration_precise}] [{wide_bar:.cyan/blue}]",
+            ).unwrap()
+        );
+    let pbar = Arc::new(Mutex::new(pbar));
+    pbar.lock().unwrap().inc(0); // Makes pbar show up with 0/N files complete
+
+    // First round is a merge (s3 -> local overflows)
+    let threadpool = ThreadPool::new(threads);    
+    let wds_chunk_id = Arc::new(AtomicUsize::new(0));
+    let total_token_count = Arc::new(AtomicUsize::new(0));    
+    for i in 0..num_local_cells {
+        let mut local_cell_bank = input.clone();
+        local_cell_bank.push(format!("cell_{:08}", i));
+        let output = output.clone();
+        let pbar = pbar.clone();
+        let local_cell_dir = local_cell_dir.clone();
+        let wds_chunk_id = wds_chunk_id.clone();
+        let total_token_count = total_token_count.clone();
+        threadpool.execute(move || {
+            let remote_cells = expand_dirs(vec![local_cell_bank]).unwrap();
+            process_multiple_cells(remote_cells, local_cell_dir, output, wds_chunk_id, total_token_count, pbar).unwrap();            
+        });
+    }
+
+
+    // Following rounds are (local -> local)
+    let overflow_reduction = 16;    
+    let src_filenames : Vec<PathBuf> = expand_dirs(vec![local_cell_dir]).unwrap();
+    let mut overflow_round = 0;
+    let mut num_overflows = num_local_cells / overflow_reduction;
+    let mut src_filenames: Vec<PathBuf> = (0..num_local_cells)
+        .map(|idx| local_cell_id(&local_cell_dir, idx)).collect();
+    let overflow_reduction = 16;
+    while src_filenames.len() > 0 {
+
+        let threadpool = ThreadPool::new(threads);    
+        let (overflow_writers, overflow_filenames) = build_overflow_writers(&local_cell_dir, overflow_round, num_overflows);
+        println!("STARTING ROUND {:?} | {:?} SRC FILES | {:?} WRITERS",
+                 overflow_round, src_filenames.len(), overflow_filenames.len());        
+        let src_pointer = &src_filenames;
+        for filename in src_pointer {     
+            let filename = filename.clone();       
+            let output_dir = output.clone();
+            let wds_chunk_id = wds_chunk_id.clone();
+            let total_token_count = total_token_count.clone();
+            let overflow_writers = overflow_writers.clone();
+            let pbar = pbar.clone();
+            threadpool.execute(move || {
+                process_local_cell(&filename, &overflow_writers, &output_dir, wds_chunk_size, &wds_chunk_id,
+                                   &total_token_count, hash_seed, pbar).unwrap()
+            });                        
+        } 
+        threadpool.join();
+        overflow_round += 1;
+        if num_overflows == 1 {
+            num_overflows = 0;
+        } else {
+            num_overflows = num_overflows / overflow_reduction;
+            if num_overflows == 0 {
+                num_overflows = 1;
+            }
+        }
+        src_filenames = overflow_filenames.clone();
+    };
+    
+    Ok(())
+}
+
