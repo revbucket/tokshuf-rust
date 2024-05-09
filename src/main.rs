@@ -499,7 +499,7 @@ fn finalize_chunk(chunk: &[Vec<i32>], output_dir: &PathBuf,
             let json_string = serde_json::to_string(&context).unwrap();
             let mut header = tar::Header::new_gnu();
             let mut uid = Uuid::new_v4().to_string();
-            uid.push_str(".jsonl.gz");
+            uid.push_str(".json.gz");
 
             let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
             encoder.write_all(json_string.as_bytes()).unwrap();
