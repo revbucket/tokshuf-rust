@@ -10,7 +10,7 @@ use std::io::{BufReader, BufRead, BufWriter, Cursor, Write};
 use std::fs::{OpenOptions, File};
 use std::fs;
 use std::thread::available_parallelism;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::hash::{Hash, Hasher, DefaultHasher};
@@ -314,7 +314,7 @@ fn load_tiktoken_tokenizer(tokenizer_name: &String) -> Result<CoreBPE> {
 ======================================================*/
 
 fn process_input_file(input_file: &PathBuf, local_cell_mapper: &HashMap<usize, Arc<Mutex<BufWriter<File>>>>, 
-                      seqlen: usize, tokenizer_name: String, num_local_cells: usize, hash_seed: usize, use_tiktoken: bool,
+                      seqlen: usize, tokenizer_name: String, hash_seed: usize, use_tiktoken: bool,
                       pbar: Arc<Mutex<ProgressBar>>) -> Result<(), Error> {
     // Given input file (local or s3) will load it into memory and tokenize it entirely
     // And then it will "semishuffle" it and put contexts into appropriate local cell
@@ -339,7 +339,7 @@ fn process_input_file(input_file: &PathBuf, local_cell_mapper: &HashMap<usize, A
     };
 
     // Do the semishuffle and put contexts into local cells
-    match tokenize_semishuffle_file(reader, local_cell_mapper, seqlen, tokenizer_name, num_local_cells, hash_seed, use_tiktoken) {
+    match tokenize_semishuffle_file(reader, local_cell_mapper, seqlen, tokenizer_name, hash_seed, use_tiktoken) {
         Ok(_) => {
             pbar.lock().unwrap().inc(1);
             return Ok(());
@@ -352,23 +352,29 @@ fn process_input_file(input_file: &PathBuf, local_cell_mapper: &HashMap<usize, A
 }
 
 
-fn tokenize_from_reader(reader: BufReader<Cursor<Vec<u8>>>, tokenizer_name: String, 
-                        use_tiktoken: bool) -> Result<Vec<i32>, Error> {
-    // Given an input file (as an in-memory reader of bytes), loads the tokenizer and tokenizes all lines into a big vector
-    let mut all_tokens = Vec::new();
+
+fn tokenize_semishuffle_file(reader: BufReader<Cursor<Vec<u8>>>, local_cell_mapper: &HashMap<usize, Arc<Mutex<BufWriter<File>>>>, 
+                            seqlen: usize, tokenizer_name: String, 
+                            hash_seed: usize, use_tiktoken: bool) -> Result<(), Error> {
+    // For a reader, will tokenize each line, build contexts, and put each context into the appropriate local cell
+    let mut all_tokens = VecDeque::new();
     if use_tiktoken {
         let tokenizer = load_tiktoken_tokenizer(&tokenizer_name)?;
         for line in reader.lines() {
             let line = line?;
             let json: Value = serde_json::from_str(&line)?;
             let text = json["text"].as_str().unwrap();
+
+
             let encoded = tokenizer.encode_with_special_tokens(text);
+
             let mut tokens = cast_vector::<usize, i32>(encoded).unwrap();
             tokens.push(EOT_TOKEN);
             if tokenizer_name.as_str() == "meta-llama/Meta-Llama-3-8B" {
-                all_tokens.push(LLAMA3_BOS_TOKEN);
+                all_tokens.push_back(LLAMA3_BOS_TOKEN);
             }
-            all_tokens.extend(tokens);
+            all_tokens.append(&mut VecDeque::from(tokens));
+            all_tokens = write_contexts(all_tokens, local_cell_mapper, seqlen, hash_seed).unwrap();
         }
     } else {
         let tokenizer = load_tokenizer(&tokenizer_name).unwrap();
@@ -381,35 +387,33 @@ fn tokenize_from_reader(reader: BufReader<Cursor<Vec<u8>>>, tokenizer_name: Stri
             let mut tokens = cast_vector::<u32, i32>(encoded.get_ids().to_vec()).unwrap();
             tokens.push(EOT_TOKEN);
             //tokens.push(tokenizer.token_to_id("<EOT>").unwrap());
-            all_tokens.extend(tokens);       
+            all_tokens.append(&mut VecDeque::from(tokens));
+            all_tokens = write_contexts(all_tokens, local_cell_mapper, seqlen, hash_seed).unwrap();
         }        
     }
-    Ok(all_tokens)
-}
 
-
-fn tokenize_semishuffle_file(reader: BufReader<Cursor<Vec<u8>>>, local_cell_mapper: &HashMap<usize, Arc<Mutex<BufWriter<File>>>>, 
-                            seqlen: usize, tokenizer_name: String, num_local_cells: usize, 
-                            hash_seed: usize, use_tiktoken: bool) -> Result<(), Error> {
-    // For a reader, will tokenize each line, build contexts, and put each context into the appropriate local cell
-    let all_tokens = tokenize_from_reader(reader, tokenizer_name, use_tiktoken).unwrap();
-
-    // Group tokens into contexts of length seqlen
-    // And then figure out where each group should live and append it to that file
-    for chunk in all_tokens.chunks(seqlen) {
-        let mut context = chunk.to_vec();
-        if context.len() < seqlen {
-            let padding_size = seqlen - context.len();
-            context.extend(vec![PAD_TOKEN; padding_size]);
-        }
-        let local_cell_fid = (hash_vec(&context, hash_seed) % num_local_cells as u64) as usize;
-        let mut writer = local_cell_mapper.get(&local_cell_fid).unwrap().lock().unwrap();
-        serialize_into(&mut *writer, &context).unwrap();        
+    while all_tokens.len() < seqlen {
+        all_tokens.push_back(PAD_TOKEN);
     }
+    let _ = write_contexts(all_tokens, local_cell_mapper, seqlen, hash_seed).unwrap();
 
     Ok(())
 }
 
+
+fn write_contexts(mut tokens: VecDeque<i32>, local_cell_mapper: &HashMap<usize, Arc<Mutex<BufWriter<File>>>>,
+                  seqlen: usize, hash_seed: usize) -> Result<VecDeque<i32>> {
+    // Given a vector of tokens, will try to take the first seqlen and write them to their appropriate file
+    // If the tokens have length less than seqlen, they will do nothing
+    let num_local_cells = local_cell_mapper.len();
+    while tokens.len() >= seqlen {
+        let context: Vec<i32> = tokens.drain(..seqlen).collect();
+        let local_cell_fid = (hash_vec(&context, hash_seed) % num_local_cells as u64) as usize;
+        let mut writer = local_cell_mapper.get(&local_cell_fid).unwrap().lock().unwrap();
+        serialize_into(&mut *writer, &context).unwrap();
+    }
+    Ok(tokens)
+}
 
 
 /*======================================================
@@ -631,7 +635,7 @@ fn main() {
         let pbar = pbar.clone();
         threadpool.execute(move || {
             process_input_file(&input_file, &local_cell_mapper, args.seqlen, tokenizer_name,
-                               args.num_local_cells, args.hash_seed, args.use_tiktoken, pbar).unwrap()
+                               args.hash_seed, args.use_tiktoken, pbar).unwrap()
         });
     }
     threadpool.join();
