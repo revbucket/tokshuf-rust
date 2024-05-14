@@ -88,12 +88,13 @@ pub(crate) async fn get_s3_client() -> Result<Client, S3Error> {
 }
 
 
-pub(crate) async fn expand_s3_dir(s3_uri: &PathBuf) -> Result<Vec<PathBuf>, S3Error> {
+pub(crate) async fn expand_s3_dir(s3_uri: &PathBuf, ext: Option<&str>) -> Result<Vec<PathBuf>, S3Error> {
     // Collects all .json.gz/.jsonl.gz files prefixed by the provided s3_uri 
     let mut s3_files: Vec<PathBuf> = Vec::new();
     let client = get_s3_client().await?;
     let (bucket, prefix) = split_s3_path(s3_uri);
 
+    let ext = ext.unwrap_or(".jsonl.gz");
     let mut response = client
         .list_objects_v2()    
         .bucket(bucket.to_owned())
@@ -105,8 +106,8 @@ pub(crate) async fn expand_s3_dir(s3_uri: &PathBuf) -> Result<Vec<PathBuf>, S3Er
         match result {
             Ok(output) => {
                 for object in output.contents() {
-                    let key = object.key().unwrap_or_default();
-                    if !(key.ends_with(".jsonl.gz") || key.ends_with(".json.gz") || key.ends_with(".jsonl.zstd")) {
+                    let key = object.key().unwrap_or_default();                    
+                    if !key.ends_with(ext) {
                         continue;
                     }
                     let mut s3_file = PathBuf::from("s3://");

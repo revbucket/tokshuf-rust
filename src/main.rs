@@ -147,7 +147,7 @@ struct Args {
 pub(crate) fn expand_dirs(paths: Vec<PathBuf>, ext: Option<&str>) -> Result<Vec<PathBuf>> {
     // For local directories -> does a glob over each directory to get all files with given extension
     // For s3 directories -> does an aws s3 ls to search for files
-    let ext = ext.unwrap_or(".json*.gz"); // Defaults to jsonl.gz, json.gz
+    let ext = ext.unwrap_or(".jsonl.gz"); // Defaults to jsonl.gz, json.gz
 
     let mut files: Vec<PathBuf> = Vec::new();
     let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -157,7 +157,7 @@ pub(crate) fn expand_dirs(paths: Vec<PathBuf>, ext: Option<&str>) -> Result<Vec<
         if is_s3(path.clone()) {
             // Use async_std to block until we scour the s3 directory for files
             runtime.block_on(async {
-                let s3_paths = expand_s3_dir(&path).await.unwrap();
+                let s3_paths = expand_s3_dir(&path, Some(ext)).await.unwrap();
                 files.extend(s3_paths);                
             });                
         }
@@ -800,6 +800,7 @@ fn main() -> Result<()> {
     // Step 2: Do the coarse sort
     let input_files = if args.shuffle_only {
         expand_dirs(args.input, Some(".tar")).unwrap() 
+
     } else {
         expand_dirs(args.input, None).unwrap()
     };
