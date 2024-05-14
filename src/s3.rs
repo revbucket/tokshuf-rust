@@ -148,10 +148,13 @@ pub(crate) async fn get_reader_from_s3<P: AsRef<Path>>(path: P, num_retries: Opt
         let mut reader = tBufReader::with_capacity(1024 * 1024, zstd);
         reader.read_to_end(&mut data).await.expect("Failed to read data {:path}");
 
-    } else {
+    } else if path.as_ref().extension().unwrap() == "gz" {
         let gz = asyncGZ::new(body_stream);
         let mut reader = tBufReader::with_capacity(1024 * 1024, gz);
         reader.read_to_end(&mut data).await.expect("Failed to read data {:path}");        
+    } else {
+        let mut reader = tBufReader::with_capacity(1024 * 1024, body_stream);
+        reader.read_to_end(&mut data).await.expect("Failed to read data {:path}");
     };
 
     let cursor = Cursor::new(data);
