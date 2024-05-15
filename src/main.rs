@@ -669,6 +669,8 @@ fn finalize_chunk(chunk: &[(PathBuf, Vec<u8>)], output_dir: &PathBuf,
         for (path, contents) in chunk {
             let mut header = tar::Header::new_gnu();
             let mut contents = contents.as_slice();
+            header.set_size(contents.len() as u64);
+            header.set_cksum();
             builder.append_data(&mut header, path, &mut contents).unwrap();
         }
         builder.finish().unwrap();
