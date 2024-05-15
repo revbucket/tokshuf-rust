@@ -135,6 +135,12 @@ struct Args {
     #[arg(long, default_value_t=false)]
     shuffle_only: bool,
 
+    /// Extension for which files to look for:
+    /// In shuffle only case this should be tar,
+    /// In regular case this should be either jsonl.zstd or jsonl.gz
+    #[arg(long)]
+    ext: String,
+
 }
 
 
@@ -796,14 +802,16 @@ fn main() -> Result<()> {
     } else {
         args.threads
     };
-
-    // Step 2: Do the coarse sort
-    let input_files = if args.shuffle_only {
-        expand_dirs(args.input, Some(".tar")).unwrap() 
-
+    let ext = if args.ext.len() > 0 {
+        Some(args.ext.as_str())
+    } else if args.shuffle_only {
+        Some("tar")
     } else {
-        expand_dirs(args.input, None).unwrap()
+        Some("jsonl.gz")
     };
+
+    let input_files = expand_dirs(args.input, ext).unwrap();
+    // Step 2: Do the coarse shuffle
     let total_token_count = coarse_shuffle(&input_files, &args.local_cell_dir, threads, args.num_local_cells,
                                            args.seqlen, args.hash_seed, args.shuffle_only,
                                            &args.tokenizer, args.use_tiktoken).unwrap();
