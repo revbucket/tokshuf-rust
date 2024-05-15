@@ -38,6 +38,8 @@ use zstd::stream::read::Decoder as ZstdDecoder;
 use base64::{engine::general_purpose, Engine as _};
 
 use rustc_hash::FxHashMap;
+use rand::seq::SliceRandom;
+use rand::thread_rng;
 
 use tiktoken_rs::CoreBPE;
 pub mod s3;
@@ -603,10 +605,11 @@ fn process_local_cell(filename: &PathBuf, overflow_writer: &Option<CellMap>, out
     // For complete chunks, finalizes these and pushes to output directory
     // For incomplete chunks, if overflow writer exists -> write incomplete chunks to overflow file
     // Also does some branching: if no overflow writer, then this is final step and we can write chunks in parallel
-    
+    let mut rng = thread_rng(); // TODO: reproducible shuffling (maybe seed the filename?)
     let file = File::open(filename).unwrap();
     let reader = BufReader::new(file);
     let mut archive = Archive::new(reader);
+
 
     // Load all tar file into vec of (path, contents) [idk, weird errors if I try to skip this step]
     let mut loaded_entries: Vec<(PathBuf, Vec<u8>)> = Vec::new();    
@@ -617,6 +620,7 @@ fn process_local_cell(filename: &PathBuf, overflow_writer: &Option<CellMap>, out
         entry.read_to_end(&mut contents).unwrap();
         loaded_entries.push((path, contents));
     }
+    loaded_entries.shuffle(&mut rng);
 
     //println!("FILENAME {:?} | ENTRIES {:?}", filename, loaded_entries.len());
     for chunk in loaded_entries.chunks(wds_chunk_size) {
