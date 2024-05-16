@@ -21,7 +21,7 @@ use threadpool::ThreadPool;
 use crate::s3::{is_s3, expand_s3_dir, get_reader_from_s3, write_cursor_to_s3};
 
 use serde_json::{Value, json};
-use tar::{Builder, Archive};
+use tar::{Builder, Archive, HeaderMode};
 use serde_json;
 
 use uuid::Uuid;
@@ -604,6 +604,7 @@ fn coarse_shuffle_single_tarfile(input_file: &PathBuf,
         entry.read_to_end(&mut data).unwrap();
         let mut header = tar::Header::new_gnu();
         header.set_size(data.len() as u64);
+        header.set_mode(0o644);
         header.set_cksum();
         let local_cell_fid = (rng.next_u64() % num_local_cells as u64) as usize;
         let path = entry.path().unwrap();
