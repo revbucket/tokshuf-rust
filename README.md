@@ -56,7 +56,7 @@ Just copying the docstring in `src/main.rs`:
 # Example:
 Suppose you have a bunch of .jsonl.gz files on s3 at `s3://my-bucket/path/to/input/data` and want to put the tokenized/shuffled data at `s3://my-bucket/path/to/output/data`, and you have plenty of hard drive storage at `/tmp`, then run something like:
 
-`cargo run --release -- --input s3://my-bucket/path/to/input/data --outut s3://my/bucket/path/to/output/data --local-cell-dir /tmp/`
+`cargo run --release -- --input s3://my-bucket/path/to/input/data --outut s3://my/bucket/path/to/output/data --local-cell-dir /tmp/ --ext jsonl.gz`
 
 System reqs for storage are kinda high, so probably not good for TB-scale datasets yet.
 
