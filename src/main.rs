@@ -704,6 +704,7 @@ fn finalize_chunk(chunk: &[(PathBuf, Vec<u8>)], output_dir: &PathBuf,
             let mut contents = contents.as_slice();
             header.set_size(contents.len() as u64);
             header.set_cksum();
+            header.set_mode(0o644);
             let output_context_path = PathBuf::from(format!("{:08}_{:08}_{}", chunk_id, idx, path.display()));
             builder.append_data(&mut header, output_context_path, &mut contents).unwrap();
         }
