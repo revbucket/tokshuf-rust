@@ -39,7 +39,8 @@ use base64::{engine::general_purpose, Engine as _};
 
 use rustc_hash::FxHashMap;
 use rand::seq::SliceRandom;
-use rand::thread_rng;
+use rand::prelude::*;
+use rand::SeedableRng;
 
 use tiktoken_rs::CoreBPE;
 pub mod s3;
@@ -120,9 +121,10 @@ struct Args {
     #[arg(long, default_value_t=128)]
     num_local_cells: usize,
 
-    /// Seed to use for the hashing of documents
+    /// Global seed to use for rngs
+    /// (Don't worry -- everything is seeded with this AND something else)
     #[arg(long, default_value_t=1234)]
-    hash_seed: usize,
+    seed: usize,
 
     /// How many times to retry s3 operations
     #[arg(long, default_value_t=3)]
@@ -285,13 +287,13 @@ fn build_cellmap(filenames: &Vec<PathBuf>) -> Option<CellMap> {
 
 
 fn write_contexts(mut tokens: VecDeque<i32>, local_cell_mapper: &CellMap,
-                  seqlen: usize, hash_seed: usize) -> Result<VecDeque<i32>> {
+                  seqlen: usize, rng: &mut rand::prelude::StdRng) -> Result<VecDeque<i32>> {
     // Given a vector of tokens, will try to take the first seqlen and write them to their appropriate file
     // If the tokens have length less than seqlen, they will do nothing
     let num_local_cells = local_cell_mapper.len(); 
     while tokens.len() >= seqlen {
         let context: Vec<i32> = tokens.drain(..seqlen).collect();
-        let local_cell_fid = (hash_vec(&context, hash_seed) % num_local_cells as u64) as usize;
+        let local_cell_fid = (rng.next_u64() % num_local_cells as u64) as usize;
         let json_string = serde_json::to_string(&context).unwrap();
         let mut header = tar::Header::new_gnu();
         let mut uid = Uuid::new_v4().to_string();
@@ -462,7 +464,7 @@ Two cases:
 
 
 fn coarse_shuffle(input_files: &Vec<PathBuf>, local_cell_dir: &PathBuf, 
-                    threads: usize, num_local_cells: usize, seqlen: usize, hash_seed: usize, shuffle_only: bool,
+                    threads: usize, num_local_cells: usize, seqlen: usize, seed: usize, shuffle_only: bool,
                     tokenizer_name: &String, use_tiktoken: bool) -> Result<Arc<AtomicUsize>, Error> {
     // Takes a list of tars and spawns a buncha threads to process each one individually
     // by taking the pre-created contexts and putting them into tar-buckets based on their hashes (or randomly?)
@@ -484,10 +486,11 @@ fn coarse_shuffle(input_files: &Vec<PathBuf>, local_cell_dir: &PathBuf,
     let threadpool = ThreadPool::new(threads);
     let token_count = Arc::new(AtomicUsize::new(0));
 
-    for input_file in input_files {
+    for (input_idx, input_file) in input_files.iter().enumerate() {
+        let input_idx = input_idx.clone();
         let input_file = input_file.clone();
         let local_cell_mapper = local_cell_mapper.clone();
-        let hash_seed = hash_seed.clone();
+        let seed = seed.clone();
         let pbar = pbar.clone();
         let seqlen = seqlen.clone();
         let token_count = token_count.clone();
@@ -495,10 +498,10 @@ fn coarse_shuffle(input_files: &Vec<PathBuf>, local_cell_dir: &PathBuf,
         let tokenizer_name = tokenizer_name.clone();
         threadpool.execute(move || {
             if shuffle_only {
-                coarse_shuffle_single_tarfile(&input_file, local_cell_mapper, hash_seed).unwrap();
+                coarse_shuffle_single_tarfile(&input_file, local_cell_mapper, seed, input_idx).unwrap();
             } else {
-                tokenize_coarse_shuffle_single(&input_file, local_cell_mapper, hash_seed, seqlen, 
-                                               token_count, &tokenizer_name, use_tiktoken).unwrap();
+                tokenize_coarse_shuffle_single(&input_file, local_cell_mapper, seed, seqlen, 
+                                               token_count, &tokenizer_name, use_tiktoken, input_idx).unwrap();
             }
             pbar.lock().unwrap().inc(1);
         });
@@ -512,8 +515,15 @@ fn coarse_shuffle(input_files: &Vec<PathBuf>, local_cell_dir: &PathBuf,
     Ok(token_count)
 }
 
-fn tokenize_coarse_shuffle_single(input_file: &PathBuf, local_cell_mapper: CellMap, hash_seed: usize, seqlen: usize, token_count: Arc<AtomicUsize>,
-                               tokenizer_name: &String, use_tiktoken: bool) -> Result<()> {
+fn tokenize_coarse_shuffle_single(input_file: &PathBuf, local_cell_mapper: CellMap, seed: usize, seqlen: usize, token_count: Arc<AtomicUsize>,
+                               tokenizer_name: &String, use_tiktoken: bool, input_idx: usize) -> Result<()> {
+
+    // RNG is seeded with: (input_file, seed, input_idx)
+    let mut hasher = DefaultHasher::new();
+    (input_file, seed, input_idx).hash(&mut hasher);
+    let rng_seed = hasher.finish();
+    let mut rng = StdRng::seed_from_u64(rng_seed);
+
 
     let reader = read_pathbuf_to_mem(input_file).unwrap();
     // For a reader, will tokenize each line, build contexts, and put each context into the appropriate local cell
@@ -534,7 +544,7 @@ fn tokenize_coarse_shuffle_single(input_file: &PathBuf, local_cell_mapper: CellM
             }
             token_count.fetch_add(tokens.len(), Ordering::SeqCst);
             all_tokens.append(&mut VecDeque::from(tokens));
-            all_tokens = write_contexts(all_tokens, &local_cell_mapper, seqlen, hash_seed).unwrap();
+            all_tokens = write_contexts(all_tokens, &local_cell_mapper, seqlen, &mut rng).unwrap();
         }
     } else {
         let tokenizer = load_tokenizer(&tokenizer_name).unwrap();
@@ -549,7 +559,7 @@ fn tokenize_coarse_shuffle_single(input_file: &PathBuf, local_cell_mapper: CellM
             //tokens.push(tokenizer.token_to_id("<EOT>").unwrap());
             token_count.fetch_add(tokens.len(), Ordering::SeqCst);
             all_tokens.append(&mut VecDeque::from(tokens));
-            all_tokens = write_contexts(all_tokens, &local_cell_mapper, seqlen, hash_seed).unwrap();
+            all_tokens = write_contexts(all_tokens, &local_cell_mapper, seqlen, &mut rng).unwrap();
         }        
     }
 
@@ -560,7 +570,7 @@ fn tokenize_coarse_shuffle_single(input_file: &PathBuf, local_cell_mapper: CellM
 
         all_tokens.push_back(PAD_TOKEN);
     }
-    let _ = write_contexts(all_tokens, &local_cell_mapper, seqlen, hash_seed).unwrap();
+    let _ = write_contexts(all_tokens, &local_cell_mapper, seqlen, &mut rng).unwrap();
 
     Ok(())
 }
@@ -568,8 +578,17 @@ fn tokenize_coarse_shuffle_single(input_file: &PathBuf, local_cell_mapper: CellM
 
 fn coarse_shuffle_single_tarfile(input_file: &PathBuf, 
                                  local_cell_mapper: CellMap,
-                                 hash_seed: usize,
+                                 seed: usize,
+                                 input_idx: usize,
                                 ) -> Result<(), Error> {
+
+    // RNG is seeded with: (input_file, seed, input_idx)
+    let mut hasher = DefaultHasher::new();
+    (input_file, seed, input_idx).hash(&mut hasher);
+    let rng_seed = hasher.finish();
+    let mut rng = StdRng::seed_from_u64(rng_seed);
+
+
     // Loads the entries from a single tarfile and pushes them into their 
     let reader = read_pathbuf_to_mem(input_file).unwrap();
     let num_local_cells = local_cell_mapper.len() as u64;
@@ -583,7 +602,7 @@ fn coarse_shuffle_single_tarfile(input_file: &PathBuf,
         let mut header = tar::Header::new_gnu();
         header.set_size(data.len() as u64);
         header.set_cksum();
-        let local_cell_fid = (hash_vec(&data, hash_seed) % num_local_cells) as usize;
+        let local_cell_fid = (rng.next_u64() % num_local_cells as u64) as usize;
         let path = entry.path().unwrap();
         let mut builder = local_cell_mapper.get(&local_cell_fid).unwrap().lock().unwrap();
         builder.append_data(&mut header, path, data.as_slice()).unwrap();
@@ -599,13 +618,19 @@ fn coarse_shuffle_single_tarfile(input_file: &PathBuf,
 
 fn process_local_cell(filename: &PathBuf, overflow_writer: &Option<CellMap>, output_dir: &PathBuf, 
                       wds_chunk_size: usize, wds_chunk_id: &AtomicUsize, total_token_count: &Arc<AtomicUsize>,
-                      hash_seed: usize, manifest_vec: Arc<Mutex<Vec<String>>>, pbar: Arc<Mutex<ProgressBar>>) -> Result<()> {
+                      seed: usize, manifest_vec: Arc<Mutex<Vec<String>>>, pbar: Arc<Mutex<ProgressBar>>) -> Result<()> {
 
     // Given a "local cell" which has a bunch of contexts in it, shuffles it and groups into chunks of wds_chunk_size
     // For complete chunks, finalizes these and pushes to output directory
     // For incomplete chunks, if overflow writer exists -> write incomplete chunks to overflow file
     // Also does some branching: if no overflow writer, then this is final step and we can write chunks in parallel
-    let mut rng = thread_rng(); // TODO: reproducible shuffling (maybe seed the filename?)
+
+    // rng is seeded from (filename, seed)
+    let mut hasher = DefaultHasher::new();
+    (filename, seed).hash(&mut hasher);
+    let rng_seed = hasher.finish();
+    let mut rng = StdRng::seed_from_u64(rng_seed);    
+
     let file = File::open(filename).unwrap();
     let reader = BufReader::new(file);
     let mut archive = Archive::new(reader);
@@ -630,13 +655,12 @@ fn process_local_cell(filename: &PathBuf, overflow_writer: &Option<CellMap>, out
             let num_overflows = overflow_writer.len() as u64;
             // println!("FILENAME {:?} | HAS LEFTOVERS {:?} | {:?}", filename, chunk.len(), chunk[0].0);
             for (path, contents) in chunk {
-                let content_hash = hash_vec::<u8>(contents, hash_seed);
                 let mut header = tar::Header::new_gnu();
                 let mut contents = contents.as_slice();
                 header.set_size(contents.len() as u64);
                 header.set_cksum();
                 let mut builder = overflow_writer
-                    .get(&((content_hash % num_overflows) as usize))
+                    .get(&((rng.next_u64() % num_overflows as u64) as usize))
                     .unwrap()
                     .lock()
                     .unwrap();
@@ -657,7 +681,7 @@ fn process_local_cell(filename: &PathBuf, overflow_writer: &Option<CellMap>, out
 
 fn finalize_chunk(chunk: &[(PathBuf, Vec<u8>)], output_dir: &PathBuf, 
                   wds_chunk_id: &AtomicUsize, total_context_count: &Arc<AtomicUsize>, 
-                  manifest_vec: &Arc<Mutex<Vec<String>>>
+                  manifest_vec: &Arc<Mutex<Vec<String>>>,
                 ) -> Result<()> {
     // Given a chunk, output directory, and atomic id/namer, and atomic token-counter
     // Wraps the chunk in a tarfile and saves it in the output dir
@@ -668,14 +692,16 @@ fn finalize_chunk(chunk: &[(PathBuf, Vec<u8>)], output_dir: &PathBuf,
 
     // And then wraps the chunk in a tarfile 
     let mut bio = Cursor::new(Vec::new());
+
     {
         let mut builder = Builder::new(&mut bio);
-        for (path, contents) in chunk {
+        for (idx, (path, contents)) in chunk.iter().enumerate() {
             let mut header = tar::Header::new_gnu();
             let mut contents = contents.as_slice();
             header.set_size(contents.len() as u64);
             header.set_cksum();
-            builder.append_data(&mut header, path, &mut contents).unwrap();
+            let output_context_path = PathBuf::from(format!("{:08}_{:08}_{}", chunk_id, idx, path.display()));
+            builder.append_data(&mut header, output_context_path, &mut contents).unwrap();
         }
         builder.finish().unwrap();
     }
@@ -708,7 +734,7 @@ fn finalize_chunk(chunk: &[(PathBuf, Vec<u8>)], output_dir: &PathBuf,
 
 
 fn fine_sort_and_save(local_cell_dir: &PathBuf, output: &PathBuf, num_local_cells: usize,
-                      threads: usize, wds_chunk_size: usize, hash_seed: usize) -> Result<Arc<AtomicUsize>, Error> {
+                      threads: usize, wds_chunk_size: usize, seed: usize) -> Result<Arc<AtomicUsize>, Error> {
     println!("Starting fineSort/upload loop...");
 
     // First count how many TOTAL files we need to process (and build a pbar from this)
@@ -756,7 +782,7 @@ fn fine_sort_and_save(local_cell_dir: &PathBuf, output: &PathBuf, num_local_cell
             let pbar = pbar.clone();
             threadpool.execute(move || {
                 process_local_cell(&filename, &overflow_writers, &output_dir, wds_chunk_size, &wds_chunk_id,
-                                   &total_context_count, hash_seed, manifest_vec, pbar).unwrap()
+                                   &total_context_count, seed, manifest_vec, pbar).unwrap()
             });                        
         } 
         threadpool.join();
@@ -819,12 +845,12 @@ fn main() -> Result<()> {
     let input_files = expand_dirs(args.input, ext).unwrap();
     // Step 2: Do the coarse shuffle
     let total_token_count = coarse_shuffle(&input_files, &args.local_cell_dir, threads, args.num_local_cells,
-                                           args.seqlen, args.hash_seed, args.shuffle_only,
+                                           args.seqlen, args.seed, args.shuffle_only,
                                            &args.tokenizer, args.use_tiktoken).unwrap();
     
     // Step 3: Do the "fine-grained" sorting and upload/save in wds format
     let total_context_count = fine_sort_and_save(&args.local_cell_dir, &args.output, args.num_local_cells, 
-                                                 threads, args.wds_chunk_size, args.hash_seed).unwrap();
+                                                 threads, args.wds_chunk_size, args.seed).unwrap();
 
 
 
