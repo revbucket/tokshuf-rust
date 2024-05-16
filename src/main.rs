@@ -9,6 +9,7 @@ use glob::glob;
 use std::io::{BufReader, BufRead, BufWriter, Cursor, Write};
 use std::fs::{OpenOptions, File};
 use std::fs;
+use std::os::unix::fs::OpenOptionsExt;
 
 
 use std::thread::available_parallelism;
@@ -18,6 +19,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::hash::{Hash, Hasher, DefaultHasher};
 use threadpool::ThreadPool;
 use crate::s3::{is_s3, expand_s3_dir, get_reader_from_s3, write_cursor_to_s3};
+
 use serde_json::{Value, json};
 use tar::{Builder, Archive};
 use serde_json;
@@ -277,6 +279,7 @@ fn build_cellmap(filenames: &Vec<PathBuf>) -> Option<CellMap> {
             OpenOptions::new()
             .append(true)
             .create(true)
+            .mode(0o644)
             .open(filename)
             .unwrap()
         ))));
