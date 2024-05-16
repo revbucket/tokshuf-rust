@@ -252,7 +252,7 @@ fn get_overflow_basename(overflow_round: usize, overflow_id: usize) -> PathBuf {
 
 fn get_chunk_basename(chunk_id: usize) -> PathBuf {
     // Standardized method to name each output chunk tarfile
-    PathBuf::from(format!("chunk_{:08}.tar", chunk_id))
+    PathBuf::from(format!("shard_{:08}.tar", chunk_id))
 }
 
 
