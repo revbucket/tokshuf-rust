@@ -11,17 +11,16 @@ use std::fs::{OpenOptions, File};
 use std::fs;
 use std::os::unix::fs::OpenOptionsExt;
 
-
 use std::thread::available_parallelism;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::hash::{Hash, Hasher, DefaultHasher};
 use threadpool::ThreadPool;
-use crate::s3::{is_s3, expand_s3_dir, get_reader_from_s3, write_cursor_to_s3};
+use crate::s3::{is_s3, expand_s3_dir, get_reader_from_s3, write_cursor_to_s3, count_s3_dirsize};
 
 use serde_json::{Value, json};
-use tar::{Builder, Archive, HeaderMode};
+use tar::{Builder, Archive};
 use serde_json;
 
 use uuid::Uuid;
@@ -29,7 +28,6 @@ use indicatif::{ProgressBar,ProgressStyle};
 use tokenizers::tokenizer::{
     Tokenizer
 };
-
 
 
 use flate2::read::MultiGzDecoder;
@@ -132,7 +130,7 @@ struct Args {
     #[arg(long, default_value_t=3)]
     s3_retries: usize,
 
-    /// If present, we use tiktoken to encode (only works with "EleutherAI/gpt-neox-20b"!)
+    /// If present, we use tiktoken to encode (only works with "EleutherAI/gpt-neox-20b" and llama3!)
     #[arg(long, default_value_t=false)]
     use_tiktoken: bool,
 
@@ -144,8 +142,19 @@ struct Args {
     /// Extension for which files to look for:
     /// In shuffle only case this should be tar,
     /// In regular case this should be either jsonl.zstd or jsonl.gz
-    #[arg(long)]
+    #[arg(long, default_value_t=String::from(""))]
     ext: String,
+
+
+    /// Input exp_data json (for dataset creation)
+    /// See fn make_exp_data_json for how this operates
+    #[arg(long, required=false)]
+    input_json: Option<PathBuf>,
+
+    /// Output exp_data json (for dataset creation)
+    /// See fn make_exp_data_json for how this operates
+    #[arg(long, required=false)]
+    output_json: Option<PathBuf>
 
 }
 
@@ -347,6 +356,18 @@ fn save_manifest(manifest_lines: Arc<Mutex<Vec<String>>>, output_dir: &PathBuf) 
     }
 
     Ok(())
+}
+
+fn count_tokens_from_manifest(manifest_loc: &PathBuf, seqlen: usize) -> Result<usize, Error> {
+    let mut num_tokens = 0;
+    let mut reader = read_pathbuf_to_mem(manifest_loc).unwrap();
+    for line in reader.lines() {
+        let line = line?;
+        let manifest_line: Value = serde_json::from_str(&line)?;
+        let num_sequences = manifest_line["num_sequences"].as_u64().unwrap() as usize;
+        num_tokens += num_sequences * seqlen;
+    }
+    Ok(num_tokens)
 }
 
 
@@ -815,6 +836,71 @@ fn fine_sort_and_save(local_cell_dir: &PathBuf, output: &PathBuf, num_local_cell
 }
 
 
+fn make_exp_data_json(input_json: Option<PathBuf>, output_json: Option<PathBuf>, seqlen: usize, 
+                      tokenizer: String, output_dir: &PathBuf) -> Result<(), Error> {
+    if input_json.is_none() || output_json.is_none() {
+        println!("NOT ENOUGH TO RUN THE JSON COUNTER");
+        return Ok(());
+    }
+    let input_json = input_json.unwrap();
+    let output_json = output_json.unwrap();
+  
+
+    // Load the input contents
+    let mut input_reader = read_pathbuf_to_mem(&input_json).unwrap();
+    let mut contents = Vec::new();
+    input_reader.read_to_end(&mut contents).unwrap();
+    let mut exp_data: Value = serde_json::from_slice(&contents.as_slice())?;
+    /* Need to update the following fields: 
+    - dataset_url -> output_dir
+    - manifest_url -> output_dir / 'manifest.json'
+    - tokenized -> true
+    - tokenizer -> infer if it's none to start, but warn 
+    - num_tokens -> read from manifest (assume no DD)
+    - size -> make AWS call? 
+    */
+
+    exp_data["dataset_url"] = format!("{}", output_dir.join("").display()).into();
+    let manifest_url = output_dir.join("manifest.jsonl");
+    exp_data["manifest_url"] = format!("{}", manifest_url.clone().display()).into();
+    exp_data["tokenized"] = true.into();
+    if exp_data.get("tokenizer").is_none() {
+        println!("Warning: inferring tokenizer to be {:?}", tokenizer);
+        exp_data["tokenizer"] = tokenizer.into();
+    };
+
+    let counted_tokens = count_tokens_from_manifest(&manifest_url, seqlen).unwrap();
+    if exp_data.get("num_tokens").is_none() {
+        exp_data["num_tokens"] = counted_tokens.into();
+    } else if exp_data.get("num_tokens").unwrap() != counted_tokens {
+        println!("Provided token count ({:?}) doesn't match computed: {:?}", exp_data["num_tokens"], counted_tokens);
+    } 
+
+    if exp_data.get("size").is_none() {
+        let rt = tokio::runtime::Runtime::new().unwrap(); 
+        let size = rt.block_on(count_s3_dirsize(&output_dir.clone())).unwrap();        
+        exp_data["size"] = size.into()
+    }
+
+
+    // Now output/write the file
+    let formatted_output = serde_json::to_vec_pretty(&exp_data).unwrap();
+    if is_s3(&output_json) {
+        let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();   
+        rt.block_on(write_cursor_to_s3(&output_json.clone(), Cursor::new(formatted_output))).unwrap();
+    } else {
+        if let Some(parent_dir) = output_json.parent() {
+            fs::create_dir_all(parent_dir).unwrap();
+        }        
+        let mut file = File::create(output_json.clone()).expect("Failed to create file");
+        file.write_all(formatted_output.as_slice()).unwrap();
+    }
+    Ok(())
+}
+
 
 /*==============================================================
 =                         MAIN BLOCK                           =
@@ -834,6 +920,8 @@ fn main() -> Result<()> {
     println!("Setting up Shuffle run");
     let start_time = Instant::now();    
     let args = Args::parse();
+    println!("INPUTS IS {:?}", args.input_json);
+
     let threads = if args.threads == 0 {
         available_parallelism().unwrap().get()
     } else {
@@ -858,8 +946,8 @@ fn main() -> Result<()> {
                                                  threads, args.wds_chunk_size, args.seed).unwrap();
 
 
-
-    // Step 4: Finalize by finishing the overflow writer, and writing some stats
+    // Step 4: Finalize by writing some stats and writing the exp_data tokenized json
+    make_exp_data_json(args.input_json, args.output_json, args.seqlen, args.tokenizer, args.output).unwrap();
     println!("Finishing tokenize shuffle run!");
     println!("-------------------------------");
     println!("Ran in {:?} (s)", start_time.elapsed().as_secs());

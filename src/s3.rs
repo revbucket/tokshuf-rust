@@ -125,6 +125,35 @@ pub(crate) async fn expand_s3_dir(s3_uri: &PathBuf, ext: Option<&str>) -> Result
     Ok(s3_files)
 }
 
+
+pub(crate) async fn count_s3_dirsize(s3_uri: &PathBuf) -> Result<usize, S3Error> {
+    let client = get_s3_client().await?;
+    let (bucket, prefix) = split_s3_path(s3_uri);
+    let mut response = client
+        .list_objects_v2()    
+        .bucket(bucket.to_owned())
+        .prefix(prefix.to_owned())
+        .into_paginator()
+        .send();
+
+    let mut total_size = 0;
+    while let Some(result) = response.next().await {
+        match result {
+            Ok(output) => {
+                for object in output.contents() {
+                    total_size += object.size().unwrap_or_default();
+                }
+            }
+            Err(err) => {
+                eprintln!("Error calculating s3 dir size | {err:?}");
+                return Err(err.into());
+            }
+        }
+    }
+    Ok(total_size as usize)
+}
+
+
 async fn get_object_with_retry(bucket: &str, key: &str, num_retries: usize) -> Result<ByteStream, S3Error> {
     let client = get_s3_client().await?;
     s3_retry(num_retries, || async {
