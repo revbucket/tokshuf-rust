@@ -947,7 +947,7 @@ fn main() -> Result<()> {
 
 
     // Step 4: Finalize by writing some stats and writing the exp_data tokenized json
-    make_exp_data_json(args.input_json, args.output_json, args.seqlen, args.tokenizer, args.output).unwrap();
+    make_exp_data_json(args.input_json, args.output_json, args.seqlen, args.tokenizer, &args.output).unwrap();
     println!("Finishing tokenize shuffle run!");
     println!("-------------------------------");
     println!("Ran in {:?} (s)", start_time.elapsed().as_secs());
