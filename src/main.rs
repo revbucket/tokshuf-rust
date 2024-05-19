@@ -154,7 +154,11 @@ struct Args {
     /// Output exp_data json (for dataset creation)
     /// See fn make_exp_data_json for how this operates
     #[arg(long, required=false)]
-    output_json: Option<PathBuf>
+    output_json: Option<PathBuf>,
+
+    ///DD: only works for the shuffle only for now
+    #[arg(long, default_value_t=false)]
+    dd: bool,
 
 }
 
@@ -201,6 +205,28 @@ pub(crate) fn expand_dirs(paths: Vec<PathBuf>, ext: Option<&str>) -> Result<Vec<
         }
     }
     Ok(files)
+}
+
+
+fn dd_to_groups(paths: Vec<PathBuf>, dd: bool, seqlen: usize) -> Result<HashMap<usize, Vec<PathBuf>>, Error>{
+    /* Given a flat vector, of paths, groups based on their parent directory.
+    *  I.e., assumes dd would be have file structures like [path/dd/2049/0000.tar, path/dd/2049/0001.tar, path/dd/4097/000.tar, ...]
+    Outputs: {2049 -> [files], 4097 -> [files], ...}
+    */
+    let mut dd_groups: HashMap<usize, Vec<PathBuf>> = HashMap::new();
+    if !dd {
+        // No dd, just return {seqlen: paths}
+        dd_groups.insert(seqlen, paths);
+        return Ok(dd_groups);
+    }
+
+    for path in paths {
+        let parent_name = path.parent().unwrap().file_name().unwrap().to_str().unwrap();
+        let parent_seqlen: usize = parent_name.parse().unwrap();
+        dd_groups.entry(parent_seqlen).or_insert(Vec::new()).push(path);
+    }
+
+    Ok(dd_groups)
 }
 
 fn read_pathbuf_to_mem(input_file: &PathBuf) -> Result<BufReader<Cursor<Vec<u8>>>, Error> {
@@ -360,7 +386,7 @@ fn save_manifest(manifest_lines: Arc<Mutex<Vec<String>>>, output_dir: &PathBuf) 
 
 fn count_tokens_from_manifest(manifest_loc: &PathBuf, seqlen: usize) -> Result<usize, Error> {
     let mut num_tokens = 0;
-    let mut reader = read_pathbuf_to_mem(manifest_loc).unwrap();
+    let reader = read_pathbuf_to_mem(manifest_loc).unwrap();
     for line in reader.lines() {
         let line = line?;
         let manifest_line: Value = serde_json::from_str(&line)?;
@@ -489,7 +515,7 @@ Two cases:
 
 fn coarse_shuffle(input_files: &Vec<PathBuf>, local_cell_dir: &PathBuf, 
                     threads: usize, num_local_cells: usize, seqlen: usize, seed: usize, shuffle_only: bool,
-                    tokenizer_name: &String, use_tiktoken: bool) -> Result<Arc<AtomicUsize>, Error> {
+                    tokenizer_name: &String, use_tiktoken: bool) -> Result<usize, Error> {
     // Takes a list of tars and spawns a buncha threads to process each one individually
     // by taking the pre-created contexts and putting them into tar-buckets based on their hashes (or randomly?)
     println!("Starting coarseSort loop...");
@@ -536,7 +562,7 @@ fn coarse_shuffle(input_files: &Vec<PathBuf>, local_cell_dir: &PathBuf,
         // Note: this ^ doesn't always work, so it's important that the tar::Builders go out of scope!
     }
 
-    Ok(token_count)
+    Ok(Arc::try_unwrap(token_count).unwrap().into_inner())
 }
 
 fn tokenize_coarse_shuffle_single(input_file: &PathBuf, local_cell_mapper: CellMap, seed: usize, seqlen: usize, token_count: Arc<AtomicUsize>,
@@ -760,7 +786,7 @@ fn finalize_chunk(chunk: &[(PathBuf, Vec<u8>)], output_dir: &PathBuf,
 
 
 fn fine_sort_and_save(local_cell_dir: &PathBuf, output: &PathBuf, num_local_cells: usize,
-                      threads: usize, wds_chunk_size: usize, seed: usize) -> Result<Arc<AtomicUsize>, Error> {
+                      threads: usize, wds_chunk_size: usize, seed: usize) -> Result<usize, Error> {
     println!("Starting fineSort/upload loop...");
 
     // First count how many TOTAL files we need to process (and build a pbar from this)
@@ -832,7 +858,7 @@ fn fine_sort_and_save(local_cell_dir: &PathBuf, output: &PathBuf, num_local_cell
     };
     save_manifest(manifest_vec, &output).unwrap();
 
-    Ok(total_context_count)
+    Ok(Arc::try_unwrap(total_context_count).unwrap().into_inner())
 }
 
 
@@ -920,7 +946,6 @@ fn main() -> Result<()> {
     println!("Setting up Shuffle run");
     let start_time = Instant::now();    
     let args = Args::parse();
-    println!("INPUTS IS {:?}", args.input_json);
 
     let threads = if args.threads == 0 {
         available_parallelism().unwrap().get()
@@ -936,23 +961,41 @@ fn main() -> Result<()> {
     };
 
     let input_files = expand_dirs(args.input, ext).unwrap();
-    // Step 2: Do the coarse shuffle
-    let total_token_count = coarse_shuffle(&input_files, &args.local_cell_dir, threads, args.num_local_cells,
-                                           args.seqlen, args.seed, args.shuffle_only,
-                                           &args.tokenizer, args.use_tiktoken).unwrap();
+
+
+    let input_groups = dd_to_groups(input_files, args.dd, args.seqlen).unwrap();
+    let mut total_token_count = 0;
+    let mut total_context_count = 0;
+    for (&seqlen, dd_filegroup) in input_groups.iter() { // For each DD group
+        println!("Starting DD group w/ Seqlen {:?}...", &seqlen);
+        // Step 2: Do the coarse shuffle
+        let (local_cell_dir, output_dir) = if args.dd {
+            let string_seqlen = seqlen.to_string();
+            (args.local_cell_dir.join(&string_seqlen), args.output.join(&string_seqlen))
+        } else {
+            (args.local_cell_dir.clone(), args.output.clone())
+        };
+
+        let dd_token_count = coarse_shuffle(&dd_filegroup, &local_cell_dir, threads, args.num_local_cells,
+                                               seqlen, args.seed, args.shuffle_only,
+                                               &args.tokenizer, args.use_tiktoken).unwrap();
+        total_token_count += dd_token_count;
     
-    // Step 3: Do the "fine-grained" sorting and upload/save in wds format
-    let total_context_count = fine_sort_and_save(&args.local_cell_dir, &args.output, args.num_local_cells, 
-                                                 threads, args.wds_chunk_size, args.seed).unwrap();
+        // Step 3: Do the "fine-grained" sorting and upload/save in wds format
+        let dd_context_count = fine_sort_and_save(&local_cell_dir, &output_dir, args.num_local_cells, 
+                                                     threads, args.wds_chunk_size, args.seed).unwrap();
+        total_context_count += dd_context_count;
+
+    }
 
 
     // Step 4: Finalize by writing some stats and writing the exp_data tokenized json
-    make_exp_data_json(args.input_json, args.output_json, args.seqlen, args.tokenizer, args.output).unwrap();
+    make_exp_data_json(args.input_json, args.output_json, args.seqlen, args.tokenizer, &args.output).unwrap();
     println!("Finishing tokenize shuffle run!");
     println!("-------------------------------");
     println!("Ran in {:?} (s)", start_time.elapsed().as_secs());
-    println!("Processed {:?} tokens", total_token_count.fetch_add(0, Ordering::SeqCst));
-    println!("Processed {:?} contexts", total_context_count.fetch_add(0, Ordering::SeqCst));
+    println!("Processed {:?} tokens", total_token_count);
+    println!("Processed {:?} contexts", total_context_count);
     Ok(())
 }
 
