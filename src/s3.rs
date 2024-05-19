@@ -172,7 +172,7 @@ pub(crate) async fn get_reader_from_s3<P: AsRef<Path>>(path: P, num_retries: Opt
     let body_stream = object_body.into_async_read();
     let mut data = Vec::new();
 
-    if path.as_ref().extension().unwrap() == "zstd" {
+    if (path.as_ref().extension().unwrap() == "zstd") ||  (path.as_ref().extension().unwrap() == "zst") {
         let zstd = asyncZstd::new(body_stream);
         let mut reader = tBufReader::with_capacity(1024 * 1024, zstd);
         reader.read_to_end(&mut data).await.expect("Failed to read data {:path}");
