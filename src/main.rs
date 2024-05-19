@@ -969,7 +969,7 @@ fn main() -> Result<()> {
     let mut total_token_count = 0;
     let mut total_context_count = 0;
     for (&seqlen, dd_filegroup) in input_groups.iter() { // For each DD group
-        println!("Starting DD group w/ Seqlen {:?}...", &seqlen);
+        println!("Starting DD group w/ Seqlen {:?}... | {:?} files", &seqlen, dd_filegroup.len());
         // Step 2: Do the coarse shuffle
         let (local_cell_dir, output_dir) = if args.dd {
             let string_seqlen = seqlen.to_string();
