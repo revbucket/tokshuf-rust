@@ -961,7 +961,9 @@ fn main() -> Result<()> {
     };
 
     let input_files = expand_dirs(args.input, ext).unwrap();
-
+    if args.dd {
+        assert_eq!(args.dd, args.shuffle_only);
+    }
 
     let input_groups = dd_to_groups(input_files, args.dd, args.seqlen).unwrap();
     let mut total_token_count = 0;
