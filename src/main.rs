@@ -210,10 +210,10 @@ fn read_pathbuf_to_mem(input_file: &PathBuf) -> Result<BufReader<Cursor<Vec<u8>>
                 .enable_all()
                 .build()
                 .unwrap();   
-        match rt.block_on(get_reader_from_s3(input_file, Some(5))) {
+        match rt.block_on(get_reader_from_s3(input_file, Some(10))) {
             Ok(result) => result,
             Err(err) => {
-                eprintln!("Error! {:?}", err);
+                eprintln!("Error! {:?} | {:?}", input_file, err);
                 return Err(err.into());
             }
         }
