@@ -229,6 +229,13 @@ fn dd_to_groups(paths: Vec<PathBuf>, dd: bool, seqlen: usize) -> Result<HashMap<
     Ok(dd_groups)
 }
 
+
+fn get_dd_wds_chunk_size(dd_seqlen: usize, og_seqlen: usize, og_wds_chunk_size: usize) -> usize {
+    // Trust floating point arithmetic to not be too terrible? 
+    // Basically we're assuming that: (seqlen-1) * chunk_size is kept constant, even as seqlen varies
+    ((dd_seqlen - 1)  as f64 / (og_seqlen - 1) as f64 * og_wds_chunk_size as f64).round() as usize
+}
+
 fn read_pathbuf_to_mem(input_file: &PathBuf) -> Result<BufReader<Cursor<Vec<u8>>>, Error> {
     // Generic method to read local or s3 file into memory
     let reader = if is_s3(input_file) {
@@ -969,7 +976,9 @@ fn main() -> Result<()> {
     let mut total_token_count = 0;
     let mut total_context_count = 0;
     for (&seqlen, dd_filegroup) in input_groups.iter() { // For each DD group
-        println!("Starting DD group w/ Seqlen {:?}... | {:?} files", &seqlen, dd_filegroup.len());
+        let wds_chunk_size = get_dd_wds_chunk_size(seqlen, args.seqlen, args.wds_chunk_size);
+
+        println!("Starting DD group w/ Seqlen {:?}... | {:?} files |", &seqlen, dd_filegroup.len());
         // Step 2: Do the coarse shuffle
         let (local_cell_dir, output_dir) = if args.dd {
             let string_seqlen = seqlen.to_string();
@@ -985,7 +994,7 @@ fn main() -> Result<()> {
     
         // Step 3: Do the "fine-grained" sorting and upload/save in wds format
         let dd_context_count = fine_sort_and_save(&local_cell_dir, &output_dir, args.num_local_cells, 
-                                                     threads, args.wds_chunk_size, args.seed).unwrap();
+                                                     threads, wds_chunk_size, args.seed).unwrap();
         total_context_count += dd_context_count;
 
     }
