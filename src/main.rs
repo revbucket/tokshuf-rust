@@ -43,6 +43,9 @@ use rand::prelude::*;
 use rand::SeedableRng;
 
 use tiktoken_rs::CoreBPE;
+use lazy_static::lazy_static;
+
+
 pub mod s3;
 
 
@@ -50,6 +53,35 @@ const OVERFLOW_REDUCTION: usize = 16; // maybe make this an arg?
 const LLAMA3_BOS_TOKEN: i32 = 128000;
 const EOT_TOKEN: i32 = 0;
 const PAD_TOKEN: i32 = -1; 
+
+
+
+lazy_static! {
+    static ref ALL_SHARD_SIZES: HashMap<usize, usize> = {
+        let mut map = HashMap::new();
+        map.insert(2, 32768);
+        map.insert(3, 32768);
+        map.insert(5, 32768);
+        map.insert(9, 16384);
+        map.insert(17, 16384);
+        map.insert(33, 16384);
+        map.insert(65, 16384);
+        map.insert(129, 16384);
+        map.insert(257, 8192);
+        map.insert(513, 4096);
+        map.insert(1025, 2048);
+        map.insert(2049, 1024);
+        map.insert(4097, 512);
+        map.insert(8193, 256);
+        map.insert(16385, 128);
+        map.insert(32769, 64);
+        map.insert(65537, 32);
+        map.insert(131073, 16);
+        map.insert(262145, 8);
+        map.insert(524289, 4);
+        map
+    };
+}
 
 type CellMap = HashMap<usize, Arc<Mutex<Builder<BufWriter<File>>>>>;
 
@@ -230,10 +262,10 @@ fn dd_to_groups(paths: Vec<PathBuf>, dd: bool, seqlen: usize) -> Result<HashMap<
 }
 
 
-fn get_dd_wds_chunk_size(dd_seqlen: usize, og_seqlen: usize, og_wds_chunk_size: usize) -> usize {
+fn get_dd_wds_chunk_size(dd_seqlen: usize) -> usize {
     // Trust floating point arithmetic to not be too terrible? 
     // Basically we're assuming that: (seqlen-1) * chunk_size is kept constant, even as seqlen varies
-    ((dd_seqlen - 1)  as f64 / (og_seqlen - 1) as f64 * og_wds_chunk_size as f64).round() as usize
+    *ALL_SHARD_SIZES.get(&dd_seqlen).unwrap()
 }
 
 fn read_pathbuf_to_mem(input_file: &PathBuf) -> Result<BufReader<Cursor<Vec<u8>>>, Error> {
@@ -279,8 +311,6 @@ fn read_local_file_into_memory(input_file: &PathBuf) ->Result<Cursor<Vec<u8>>, E
     }
     Ok(Cursor::new(contents))
 }
-
-
 
 
 // NAMER FUNCTIONS: NO DIRECTORY INFORMATION HERE!
@@ -976,7 +1006,12 @@ fn main() -> Result<()> {
     let mut total_token_count = 0;
     let mut total_context_count = 0;
     for (&seqlen, dd_filegroup) in input_groups.iter() { // For each DD group
-        let wds_chunk_size = get_dd_wds_chunk_size(seqlen, args.seqlen, args.wds_chunk_size);
+
+        let wds_chunk_size = if args.dd {
+            get_dd_wds_chunk_size(seqlen)
+        } else {
+            args.wds_chunk_size
+        };
 
         println!("Starting DD group w/ Seqlen {:?}... | {:?} files |", &seqlen, dd_filegroup.len());
         // Step 2: Do the coarse shuffle
