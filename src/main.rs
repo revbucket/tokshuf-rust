@@ -121,7 +121,7 @@ Flow:
 #[derive(Parser, Debug)]
 struct Args {
     /// (List of) directories/files (on s3 or local) that are jsonl.gz or jsonl.zstd files
-    #[arg(required=true, long)]
+    #[arg(required=true, long, num_args=1..)]
     input: Vec<PathBuf>,
 
     /// Local directory (need not exist yet) where local cells will exist/grow
