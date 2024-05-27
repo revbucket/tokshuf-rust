@@ -493,11 +493,9 @@ fn coarse_shuffle(input_files: &Vec<PathBuf>, local_cell_dir: &PathBuf,
     // Takes a list of tars and spawns a buncha threads to process each one individually
     // by taking the pre-created contexts and putting them into tar-buckets based on their hashes (or randomly?)
     println!("Starting coarseSort loop...");
-    println!("NUM LOCAL CELLS {:?}", num_local_cells);
     let local_cell_filenames: Vec<PathBuf> = (0..num_local_cells)
         .map(|i| local_cell_dir.clone().join(get_local_cell_basename(i)))
         .collect();
-    println!("LOCAL CELL NAMES {:?}", local_cell_filenames);
     let mut local_cell_mapper = build_cellmap(&local_cell_filenames).unwrap();
     let pbar = ProgressBar::new(input_files.len() as u64)
         .with_style(
