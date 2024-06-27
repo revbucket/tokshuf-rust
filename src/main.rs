@@ -1,55 +1,49 @@
 
 use std::io::Read;
 use std::time::Instant;
-use anyhow::{anyhow, bail, Result, Error};
+use anyhow::{anyhow, Result, Error};
 use clap::Parser;
 use std::path::{PathBuf};
 use std::convert::TryFrom;
-use glob::glob;
 use std::io::{BufReader, BufRead, BufWriter, Cursor, Write};
 use std::fs::{OpenOptions, File};
 use std::fs;
 use std::os::unix::fs::OpenOptionsExt;
-
 use std::thread::available_parallelism;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::hash::{Hash, Hasher, DefaultHasher};
 use threadpool::ThreadPool;
-use crate::s3::{is_s3, expand_s3_dir, get_reader_from_s3, write_cursor_to_s3, count_s3_dirsize};
-
 use serde_json::{Value, json};
 use tar::{Builder, Archive};
 use serde_json;
-
 use uuid::Uuid;
 use indicatif::{ProgressBar,ProgressStyle};
 use tokenizers::tokenizer::{
     Tokenizer
 };
-
-
-use flate2::read::MultiGzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
-use zstd::stream::read::Decoder as ZstdDecoder;
-
 use base64::{engine::general_purpose, Engine as _};
-
 use rustc_hash::FxHashMap;
 use rand::seq::SliceRandom;
 use rand::prelude::*;
 use rand::SeedableRng;
-
 use tiktoken_rs::CoreBPE;
-pub mod s3;
+use crate::io::{expand_dirs, read_pathbuf_to_mem, write_mem_to_pathbuf, count_dirsize};
 
+pub mod s3;
+pub mod io;
 
 const OVERFLOW_REDUCTION: usize = 16; // maybe make this an arg?
-const LLAMA3_BOS_TOKEN: i32 = 128000;
-const EOT_TOKEN: i32 = 0;
-const PAD_TOKEN: i32 = -1; 
+const LLAMA3_BOS_TOKEN: usize = 128000;
+const EOT_TOKEN_OFFSET: usize = 3;
+const PAD_TOKEN_OFFSET: usize = 2; 
+// const EOD_TOKEN_OFFSET: usize = 1;
+const GPT_NEOX_VOCAB_SIZE: usize = 50254;
+const LLAMA3_VOCAB_SIZE: usize = 128256;
+
 
 type CellMap = HashMap<usize, Arc<Mutex<Builder<BufWriter<File>>>>>;
 
@@ -164,92 +158,6 @@ struct Args {
 =========================================================*/
 
 
-
-pub(crate) fn expand_dirs(paths: Vec<PathBuf>, ext: Option<&str>) -> Result<Vec<PathBuf>> {
-    // For local directories -> does a glob over each directory to get all files with given extension
-    // For s3 directories -> does an aws s3 ls to search for files
-    let ext = ext.unwrap_or(".jsonl.gz"); // Defaults to jsonl.gz, json.gz
-
-    let mut files: Vec<PathBuf> = Vec::new();
-    let runtime = tokio::runtime::Runtime::new().unwrap();
-
-
-    for path in paths {
-        if is_s3(path.clone()) {
-            // Use async_std to block until we scour the s3 directory for files
-            runtime.block_on(async {
-                let s3_paths = expand_s3_dir(&path, Some(ext)).await.unwrap();
-                files.extend(s3_paths);                
-            });                
-        }
-        else if path.is_dir() {
-            let path_str = path
-                .to_str()
-                .ok_or_else(|| anyhow!("invalid path '{}'", path.to_string_lossy()))?;
-            let mut num_hits = 0;
-            //for entry in glob(&format!("{}/**/*.json*.gz", path_str))? {
-            for entry in glob(&format!("{}/**/*{}", path_str, ext))? {
-
-                files.push(entry?.to_path_buf());
-                num_hits += 1;
-            }
-            if num_hits == 0 {
-                bail!("No JSON Gz files found in '{}'", path_str);
-            }
-        } else {
-            files.push(path.clone());
-        }
-    }
-    Ok(files)
-}
-
-fn read_pathbuf_to_mem(input_file: &PathBuf) -> Result<BufReader<Cursor<Vec<u8>>>, Error> {
-    // Generic method to read local or s3 file into memory
-    let reader = if is_s3(input_file) {
-        let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();   
-        match rt.block_on(get_reader_from_s3(input_file, Some(10))) {
-            Ok(result) => result,
-            Err(err) => {
-                eprintln!("Error! {:?} | {:?}", input_file, err);
-                return Err(err.into());
-            }
-        }
-    } else {
-        let contents = read_local_file_into_memory(input_file).expect("Failed to read contents into memory");
-        BufReader::new(contents)
-    };
-    Ok(reader)
-} 
-
-
-fn read_local_file_into_memory(input_file: &PathBuf) ->Result<Cursor<Vec<u8>>, Error>{
-    // Takes a local file (must be local!) and reads it into a Cursor of bytes
-    let mut file = File::open(input_file).expect("Failed to open file");
-
-    let mut contents = Vec::new();
-    let ext = input_file.extension().unwrap().to_string_lossy().to_lowercase();
-    if ext == "gz" {
-        // Gzip case        
-        let mut decoder = MultiGzDecoder::new(file);
-        decoder.read_to_end(&mut contents).expect("Failed to read loca gzip file");
-    } else if ext == "zstd" || ext == "zst" {
-        // Zstd case
-        let mut decoder = ZstdDecoder::new(file).unwrap();
-        decoder.read_to_end(&mut contents).expect("Failed to read local zstd file");
-    } else {
-        file.read_to_end(&mut contents).expect("Failed to read local file");
-
-        // No compression case 
-    }
-    Ok(Cursor::new(contents))
-}
-
-
-
-
 // NAMER FUNCTIONS: NO DIRECTORY INFORMATION HERE!
 fn get_local_cell_basename(fid: usize) -> PathBuf {
     // Standardized method to name "local cell" files
@@ -298,13 +206,13 @@ fn build_cellmap(filenames: &Vec<PathBuf>) -> Option<CellMap> {
 }
 
 
-fn write_contexts(mut tokens: VecDeque<i32>, local_cell_mapper: &CellMap,
-                  seqlen: usize, rng: &mut rand::prelude::StdRng) -> Result<VecDeque<i32>> {
+fn write_contexts(mut tokens: VecDeque<usize>, local_cell_mapper: &CellMap,
+                  seqlen: usize, rng: &mut rand::prelude::StdRng) -> Result<VecDeque<usize>> {
     // Given a vector of tokens, will try to take the first seqlen and write them to their appropriate file
     // If the tokens have length less than seqlen, they will do nothing
     let num_local_cells = local_cell_mapper.len(); 
     while tokens.len() >= seqlen {
-        let context: Vec<i32> = tokens.drain(..seqlen).collect();
+        let context: Vec<usize> = tokens.drain(..seqlen).collect();
         let local_cell_fid = (rng.next_u64() % num_local_cells as u64) as usize;
         let json_string = serde_json::to_string(&context).unwrap();
         let mut header = tar::Header::new_gnu();
@@ -342,26 +250,15 @@ fn save_manifest(manifest_lines: Arc<Mutex<Vec<String>>>, output_dir: &PathBuf) 
 
     let mut output_loc = output_dir.clone();
     output_loc.push("manifest.jsonl");
-    let manifest_contents = manifest_lines.lock().unwrap().join("\n");
-    let mut manifest_contents = Cursor::new(manifest_contents.into_bytes());
-    if is_s3(&output_loc) {
-        let rt = tokio::runtime::Builder::new_current_thread()
-                 .enable_all()
-                 .build()
-                 .unwrap();
-        rt.block_on(write_cursor_to_s3(&output_loc, manifest_contents)).unwrap();
-    } else {
-        let mut file = File::create(output_loc).expect("Failed to create manifest file");
-        std::io::copy(&mut manifest_contents, &mut file).expect("Failed to write manifest");
-    }
-
+    let manifest_contents = manifest_lines.lock().unwrap().join("\n").into_bytes();
+    write_mem_to_pathbuf(&manifest_contents, &output_loc).unwrap();
     Ok(())
 }
 
 fn count_tokens_from_manifest(manifest_loc: &PathBuf, seqlen: usize) -> Result<usize, Error> {
     let mut num_tokens = 0;
-    let mut reader = read_pathbuf_to_mem(manifest_loc).unwrap();
-    for line in reader.lines() {
+    let contents = read_pathbuf_to_mem(manifest_loc).unwrap();
+    for line in contents.lines() {
         let line = line?;
         let manifest_line: Value = serde_json::from_str(&line)?;
         let num_sequences = manifest_line["num_sequences"].as_u64().unwrap() as usize;
@@ -377,14 +274,6 @@ fn count_tokens_from_manifest(manifest_loc: &PathBuf, seqlen: usize) -> Result<u
 =                    Other assorted utilities                    =
 ================================================================*/
 
-
-fn hash_vec<T>(vec: &Vec<T>, seed: usize) -> u64 where T: Hash {
-    // Hashes a vector of type T into a u64 hash value
-    let mut hasher = DefaultHasher::new();
-    seed.hash(&mut hasher);
-    vec.hash(&mut hasher);
-    hasher.finish()
-}
 
 fn cast_vector<T, U>(vec: Vec<T>) -> Result<Vec<U>, String>
 where
@@ -407,7 +296,7 @@ where
 ===================================================================*/
 
 
-fn load_tokenizer(tokenizer_name: &String) -> Result<Tokenizer> {
+fn load_tokenizer(tokenizer_name: &String) -> Result<(Tokenizer, usize)> {
     // Loads a huggingface tokenizer from pretrained name
     // Note this uses an OLDER version of huggingface tokenizers (may be a deprecated method)
     let tokenizer = Tokenizer::from_pretrained(tokenizer_name, None).unwrap();
@@ -431,21 +320,34 @@ fn load_tokenizer(tokenizer_name: &String) -> Result<Tokenizer> {
         },
     ]);
     */
-    Ok(tokenizer)
+    let vocab_size = match (*tokenizer_name).as_str() {
+        "EleutherAI/gpt-neox-20b" => GPT_NEOX_VOCAB_SIZE,
+        "meta-llama/Meta-Llama-3-8B" => LLAMA3_VOCAB_SIZE,
+        _ => {
+            return Err(anyhow!("Unknown tokenizer name: {}", tokenizer_name));
+        }
+
+    };
+
+    Ok((tokenizer, vocab_size))
 }
 
 
-fn load_tiktoken_tokenizer(tokenizer_name: &String) -> Result<CoreBPE> {
+fn load_tiktoken_tokenizer(tokenizer_name: &String) -> Result<(CoreBPE, usize)> {
     // Loats the tiktoken tokenizer. Some magic strings here, but don't worry about it ;)
-    let (pattern, tiktoken_data) = match (*tokenizer_name).as_str() {
+    let (pattern, tiktoken_data, vocab_size) = match (*tokenizer_name).as_str() {
         "EleutherAI/gpt-neox-20b" => {
             (r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+",
-             include_str!("../EleutherAI_gpt-neox-20b.tiktoken"))
-        }  
+             include_str!("../EleutherAI_gpt-neox-20b.tiktoken"),
+             GPT_NEOX_VOCAB_SIZE
+            )
+        },
         "meta-llama/Meta-Llama-3-8B" => {
             (r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
-             include_str!("../meta-llama-3-8B.tiktoken"))
-        }
+             include_str!("../meta-llama-3-8B.tiktoken"),
+             LLAMA3_VOCAB_SIZE
+             )
+        },
         _ => {
             return Err(anyhow!("Unknown tokenizer name: {}", tokenizer_name));
         }
@@ -467,7 +369,7 @@ fn load_tiktoken_tokenizer(tokenizer_name: &String) -> Result<CoreBPE> {
         pattern,
         )?;
 
-    Ok(bpe)
+    Ok((bpe, vocab_size))
 }
 
 
@@ -547,20 +449,23 @@ fn tokenize_coarse_shuffle_single(input_file: &PathBuf, local_cell_mapper: CellM
     let mut rng = StdRng::seed_from_u64(rng_seed);
 
 
-    let reader = read_pathbuf_to_mem(input_file).unwrap();
+    let contents = read_pathbuf_to_mem(input_file).unwrap();
     // For a reader, will tokenize each line, build contexts, and put each context into the appropriate local cell
-    let mut all_tokens = VecDeque::new();
+    let mut all_tokens: VecDeque<usize> = VecDeque::new();
+    let pad_token;
+    let eot_token;
+
     if use_tiktoken {
         // There's probably a better/drier way to do this tiktoken/HF branch, but I'm bad at rust =P
-        let tokenizer = load_tiktoken_tokenizer(&tokenizer_name)?;
-        for line in reader.lines() {
+        let (tokenizer, vocab_size) = load_tiktoken_tokenizer(&tokenizer_name)?;
+        eot_token = EOT_TOKEN_OFFSET + vocab_size;
+        pad_token = PAD_TOKEN_OFFSET + vocab_size;
+        for line in contents.lines() {
             let line = line?;
             let json: Value = serde_json::from_str(&line)?;
             let text = json["text"].as_str().unwrap();
-            let encoded = tokenizer.encode_with_special_tokens(text);
-
-            let mut tokens = cast_vector::<usize, i32>(encoded).unwrap();
-            tokens.push(EOT_TOKEN);
+            let mut tokens = tokenizer.encode_with_special_tokens(text);
+            tokens.push(eot_token);
             if tokenizer_name.as_str() == "meta-llama/Meta-Llama-3-8B" {
                 all_tokens.push_back(LLAMA3_BOS_TOKEN);
             }
@@ -569,15 +474,17 @@ fn tokenize_coarse_shuffle_single(input_file: &PathBuf, local_cell_mapper: CellM
             all_tokens = write_contexts(all_tokens, &local_cell_mapper, seqlen, &mut rng).unwrap();
         }
     } else {
-        let tokenizer = load_tokenizer(&tokenizer_name).unwrap();
-        for line in reader.lines() {
+        let (tokenizer, vocab_size) = load_tokenizer(&tokenizer_name).unwrap();
+        eot_token = EOT_TOKEN_OFFSET + vocab_size;
+        pad_token = PAD_TOKEN_OFFSET + vocab_size;
+        for line in contents.lines() {
             let line = line?;
             let json: Value = serde_json::from_str(&line)?;
             let text = json["text"].as_str().unwrap();
 
             let encoded = tokenizer.encode(text, false).unwrap();
-            let mut tokens = cast_vector::<u32, i32>(encoded.get_ids().to_vec()).unwrap();
-            tokens.push(EOT_TOKEN);
+            let mut tokens = cast_vector::<u32, usize>(encoded.get_ids().to_vec()).unwrap();
+            tokens.push(eot_token);
             //tokens.push(tokenizer.token_to_id("<EOT>").unwrap());
             token_count.fetch_add(tokens.len(), Ordering::SeqCst);
             all_tokens.append(&mut VecDeque::from(tokens));
@@ -589,8 +496,7 @@ fn tokenize_coarse_shuffle_single(input_file: &PathBuf, local_cell_mapper: CellM
         token_count.fetch_add(seqlen - all_tokens.len(), Ordering::SeqCst);
     }
     while all_tokens.len() < seqlen {
-
-        all_tokens.push_back(PAD_TOKEN);
+        all_tokens.push_back(pad_token);
     }
     let _ = write_contexts(all_tokens, &local_cell_mapper, seqlen, &mut rng).unwrap();
 
@@ -611,12 +517,12 @@ fn coarse_shuffle_single_tarfile(input_file: &PathBuf,
     let mut rng = StdRng::seed_from_u64(rng_seed);
 
 
-    // Loads the entries from a single tarfile and pushes them into their 
-    let reader = read_pathbuf_to_mem(input_file).unwrap();
+    // Loads the entries from a single tarfile and pushes them into their local cells
+    let contents = read_pathbuf_to_mem(input_file).unwrap();
     let num_local_cells = local_cell_mapper.len() as u64;
 
 
-    let mut tar = Archive::new(reader);
+    let mut tar = Archive::new(contents);
     for entry in tar.entries()? {
         let mut entry = entry?;
         let mut data : Vec<u8> = Vec::new();
@@ -731,20 +637,9 @@ fn finalize_chunk(chunk: &[(PathBuf, Vec<u8>)], output_dir: &PathBuf,
     }
     bio.set_position(0);
 
-    // And finally saves the chunk on disk/s3 
-    if is_s3(&chunk_filename) {
-        let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();   
-        rt.block_on(write_cursor_to_s3(&chunk_filename.clone(), bio)).unwrap();
-    } else {
-        if let Some(parent_dir) = chunk_filename.parent() {
-            fs::create_dir_all(parent_dir).unwrap();
-        }        
-        let mut file = File::create(chunk_filename.clone()).expect("Failed to create file");
-        std::io::copy(&mut bio, &mut file).expect("Failed to write to file");
-    }
+    // Save this chunk to the pathbuf
+    let chunk_contents = bio.into_inner();
+    write_mem_to_pathbuf(&chunk_contents, &chunk_filename).unwrap();
 
     // And also saves this chunk into the manifest
     total_context_count.fetch_add(chunk.len(), Ordering::SeqCst);
@@ -875,27 +770,14 @@ fn make_exp_data_json(input_json: Option<PathBuf>, output_json: Option<PathBuf>,
     } 
 
     if exp_data.get("size").is_none() {
-        let rt = tokio::runtime::Runtime::new().unwrap(); 
-        let size = rt.block_on(count_s3_dirsize(&output_dir.clone())).unwrap();        
+        let size = count_dirsize(&output_dir).unwrap();     
         exp_data["size"] = size.into()
     }
 
 
     // Now output/write the file
     let formatted_output = serde_json::to_vec_pretty(&exp_data).unwrap();
-    if is_s3(&output_json) {
-        let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();   
-        rt.block_on(write_cursor_to_s3(&output_json.clone(), Cursor::new(formatted_output))).unwrap();
-    } else {
-        if let Some(parent_dir) = output_json.parent() {
-            fs::create_dir_all(parent_dir).unwrap();
-        }        
-        let mut file = File::create(output_json.clone()).expect("Failed to create file");
-        file.write_all(formatted_output.as_slice()).unwrap();
-    }
+    write_mem_to_pathbuf(&formatted_output, &output_json).unwrap();
     Ok(())
 }
 
@@ -918,7 +800,7 @@ fn main() -> Result<()> {
     println!("Setting up Shuffle run");
     let start_time = Instant::now();    
     let args = Args::parse();
-    println!("INPUTS IS {:?}", args.input_json);
+    println!("INPUT_JSON IS {:?}", args.input_json);
 
     let threads = if args.threads == 0 {
         available_parallelism().unwrap().get()
@@ -926,14 +808,14 @@ fn main() -> Result<()> {
         args.threads
     };
     let ext = if args.ext.len() > 0 {
-        Some(args.ext.as_str())
+        Some(vec![args.ext.as_str()])
     } else if args.shuffle_only {
-        Some("tar")
+        Some(vec!["tar"])
     } else {
-        Some("jsonl.gz")
+        None
     };
 
-    let input_files = expand_dirs(args.input, ext).unwrap();
+    let input_files = expand_dirs(args.input, ext.as_deref()).unwrap();
     // Step 2: Do the coarse shuffle
     let total_token_count = coarse_shuffle(&input_files, &args.local_cell_dir, threads, args.num_local_cells,
                                            args.seqlen, args.seed, args.shuffle_only,

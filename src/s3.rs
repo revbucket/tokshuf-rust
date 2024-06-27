@@ -88,13 +88,13 @@ pub(crate) async fn get_s3_client() -> Result<Client, S3Error> {
 }
 
 
-pub(crate) async fn expand_s3_dir(s3_uri: &PathBuf, ext: Option<&str>) -> Result<Vec<PathBuf>, S3Error> {
+pub(crate) async fn expand_s3_dir(s3_uri: &PathBuf, valid_exts: &[&str]) -> Result<Vec<PathBuf>, S3Error> {
     // Collects all .json.gz/.jsonl.gz files prefixed by the provided s3_uri 
     let mut s3_files: Vec<PathBuf> = Vec::new();
     let client = get_s3_client().await?;
     let (bucket, prefix) = split_s3_path(s3_uri);
 
-    let ext = ext.unwrap_or(".jsonl.gz");
+    //let ext = ext.unwrap_or(".jsonl.gz");
     let mut response = client
         .list_objects_v2()    
         .bucket(bucket.to_owned())
@@ -106,14 +106,13 @@ pub(crate) async fn expand_s3_dir(s3_uri: &PathBuf, ext: Option<&str>) -> Result
         match result {
             Ok(output) => {
                 for object in output.contents() {
-                    let key = object.key().unwrap_or_default();                    
-                    if !key.ends_with(ext) {
-                        continue;
+                    let key = object.key().unwrap_or_default();     
+                    if valid_exts.iter().any(|ext| key.ends_with(ext)) {
+                        let mut s3_file = PathBuf::from("s3://");
+                        s3_file.push(bucket.clone());
+                        s3_file.push(key);
+                        s3_files.push(s3_file);
                     }
-                    let mut s3_file = PathBuf::from("s3://");
-                    s3_file.push(bucket.clone());
-                    s3_file.push(key);
-                    s3_files.push(s3_file);
                 }
             }
             Err(err) => {
@@ -154,6 +153,8 @@ pub(crate) async fn count_s3_dirsize(s3_uri: &PathBuf) -> Result<usize, S3Error>
 }
 
 
+
+
 async fn get_object_with_retry(bucket: &str, key: &str, num_retries: usize) -> Result<ByteStream, S3Error> {
     let client = get_s3_client().await?;
     s3_retry(num_retries, || async {
@@ -172,7 +173,7 @@ pub(crate) async fn get_reader_from_s3<P: AsRef<Path>>(path: P, num_retries: Opt
     let body_stream = object_body.into_async_read();
     let mut data = Vec::new();
 
-    if path.as_ref().extension().unwrap() == "zstd" {
+    if (path.as_ref().extension().unwrap() == "zstd") || (path.as_ref().extension().unwrap() == "zst") {
         let zstd = asyncZstd::new(body_stream);
         let mut reader = tBufReader::with_capacity(1024 * 1024, zstd);
         reader.read_to_end(&mut data).await.expect("Failed to read data {:path}");
@@ -207,6 +208,5 @@ pub(crate) async fn write_cursor_to_s3(s3_uri: &PathBuf, cursor: Cursor<Vec<u8>>
 
     Ok(response)
 }
-
 
 
