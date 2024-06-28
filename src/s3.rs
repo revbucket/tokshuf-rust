@@ -153,8 +153,6 @@ pub(crate) async fn count_s3_dirsize(s3_uri: &PathBuf) -> Result<usize, S3Error>
 }
 
 
-
-
 async fn get_object_with_retry(bucket: &str, key: &str, num_retries: usize) -> Result<ByteStream, S3Error> {
     let client = get_s3_client().await?;
     s3_retry(num_retries, || async {

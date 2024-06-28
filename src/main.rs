@@ -37,12 +37,17 @@ pub mod s3;
 pub mod io;
 
 const OVERFLOW_REDUCTION: usize = 16; // maybe make this an arg?
+
+// for some strange reason this is how we had been doing special tokens in ray:
+// EOT token -> 0 
+// PAD token -> vocab_len + 2
+// (idk, I'm not going to ask too many questions -mj)
+
 const LLAMA3_BOS_TOKEN: usize = 128000;
-const EOT_TOKEN_OFFSET: usize = 3;
 const PAD_TOKEN_OFFSET: usize = 2; 
-// const EOD_TOKEN_OFFSET: usize = 1;
 const GPT_NEOX_VOCAB_SIZE: usize = 50254;
 const LLAMA3_VOCAB_SIZE: usize = 128256;
+const EOT_TOKEN: usize = 0;
 
 
 type CellMap = HashMap<usize, Arc<Mutex<Builder<BufWriter<File>>>>>;
@@ -458,7 +463,7 @@ fn tokenize_coarse_shuffle_single(input_file: &PathBuf, local_cell_mapper: CellM
     if use_tiktoken {
         // There's probably a better/drier way to do this tiktoken/HF branch, but I'm bad at rust =P
         let (tokenizer, vocab_size) = load_tiktoken_tokenizer(&tokenizer_name)?;
-        eot_token = EOT_TOKEN_OFFSET + vocab_size;
+        eot_token = EOT_TOKEN; //EOT_TOKEN_OFFSET + vocab_size;
         pad_token = PAD_TOKEN_OFFSET + vocab_size;
         for line in contents.lines() {
             let line = line?;
@@ -475,7 +480,7 @@ fn tokenize_coarse_shuffle_single(input_file: &PathBuf, local_cell_mapper: CellM
         }
     } else {
         let (tokenizer, vocab_size) = load_tokenizer(&tokenizer_name).unwrap();
-        eot_token = EOT_TOKEN_OFFSET + vocab_size;
+        eot_token = EOT_TOKEN; // EOT_TOKEN_OFFSET + vocab_size;
         pad_token = PAD_TOKEN_OFFSET + vocab_size;
         for line in contents.lines() {
             let line = line?;
